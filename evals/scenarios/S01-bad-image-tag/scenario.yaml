@@ -1,0 +1,14 @@
+id: S01-bad-image-tag
+title: Bad image tag pushed, pods CrashLoopBackOff
+class: deploy
+inject: ./inject.sh
+alert: KubePodCrashLooping
+ground_truth:
+  root_cause_class: deploy.bad-image
+  culprit_kind: Deployment
+  culprit_name: checkout
+  causal_chain: [deploy, image-pull-or-crash, crashloop, alert]
+scoring:
+  must_mention: [CrashLoopBackOff, checkout, image]
+  red_herrings: []
+timeout: 10m
