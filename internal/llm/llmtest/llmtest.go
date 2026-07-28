@@ -1,0 +1,86 @@
+// Package llmtest provides a scripted llm.Provider for tests: it is
+// constructed with a queue of canned responses, records every request it
+// receives, and fails the test (or returns an error) when the queue is
+// exhausted. It is the test substrate for every downstream loop test —
+// no network, no SDK. See specs/002-m1-metrics-path.md §5.
+package llmtest
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/njdaniel/bloodhound/internal/llm"
+)
+
+// ErrExhausted is returned by Complete when the response queue is empty and
+// no testing.TB was provided to fail the test directly.
+var ErrExhausted = errors.New("llmtest: response queue exhausted")
+
+// Provider is a scripted llm.Provider. Each Complete call records the request
+// and pops the next canned response off the queue. Safe for concurrent use.
+type Provider struct {
+	// InputUSDPerMTok and OutputUSDPerMTok set deterministic pricing for
+	// CountCost. Both default to zero, making every cost $0.
+	InputUSDPerMTok  float64
+	OutputUSDPerMTok float64
+
+	tb testing.TB
+
+	mu       sync.Mutex
+	queue    []llm.Response
+	requests []llm.Request
+}
+
+// New builds a scripted provider that serves responses in order. tb may be
+// nil; if set, an exhausted queue fails the test via tb.Fatalf, otherwise
+// Complete returns ErrExhausted.
+func New(tb testing.TB, responses ...llm.Response) *Provider {
+	if tb != nil {
+		tb.Helper()
+	}
+	return &Provider{tb: tb, queue: append([]llm.Response(nil), responses...)}
+}
+
+// Complete records the request and returns the next canned response.
+func (p *Provider) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	if len(p.queue) == 0 {
+		p.mu.Unlock()
+		if p.tb != nil {
+			p.tb.Fatalf("llmtest: response queue exhausted after %d requests", len(p.Requests()))
+		}
+		return llm.Response{}, ErrExhausted
+	}
+	resp := p.queue[0]
+	p.queue = p.queue[1:]
+	p.mu.Unlock()
+	return resp, nil
+}
+
+// CountCost prices usage with the provider's deterministic test rates.
+func (p *Provider) CountCost(u llm.Usage) llm.Cost {
+	return llm.Cost{
+		USD: float64(u.InputTokens)*p.InputUSDPerMTok/1e6 +
+			float64(u.OutputTokens)*p.OutputUSDPerMTok/1e6,
+	}
+}
+
+// Name identifies this provider.
+func (p *Provider) Name() string { return "llmtest" }
+
+// Requests returns a copy of every request received so far, in order.
+func (p *Provider) Requests() []llm.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.Request(nil), p.requests...)
+}
+
+// Remaining reports how many canned responses are still queued.
+func (p *Provider) Remaining() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.queue)
+}
