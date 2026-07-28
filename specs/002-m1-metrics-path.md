@@ -199,9 +199,17 @@ case work dir) wraps `Provider` as decorators.
 
 Tools offered to the model: the four mcp-prom tools (definitions fetched from
 the live MCP session, so server tool descriptions are the single source of
-truth) **plus one synthetic tool** `submit_finding` whose input schema is the
-Finding schema (§3.3). The hound terminates by calling it — structured output
-via forced tool use, not by parsing prose.
+truth) **plus one synthetic tool** `submit_finding` whose input schema is
+*derived* from the Finding schema (§3.3). The hound terminates by calling it —
+structured output via forced tool use, not by parsing prose.
+
+The derivation exists because the model must not author `capture_ref` (§3.4):
+the model-facing schema replaces that evidence field with a required
+`tool_call_index` integer, and carries every other constraint through
+unchanged, so a cap added to the checked-in asset reaches the model
+automatically. One checked-in asset, two shapes. (Amended after M1
+implementation: the original text said the schema *is* the Finding schema,
+which contradicted §3.4.)
 
 ```
 messages ← [system prompt, user turn: case + focus questions]
@@ -263,7 +271,7 @@ and this JSON schema change together.
           "query": { "type": "string", "maxLength": 500 },
           "observation": { "type": "string", "maxLength": 500 },
           "capture_ref": { "type": "string",
-            "description": "Capture filename under the case work dir, e.g. mcp/003-query_range.json. Injected by the loop, not the model (§3.4)." }
+            "description": "Capture filename under the case work dir, e.g. mcp/003-query_range.json. Injected by the loop, not the model (§3.4). The model-facing submit_finding schema replaces this field with a required tool_call_index integer — see §3.2." }
         }
       }
     },
