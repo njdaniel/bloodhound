@@ -1,0 +1,38 @@
+{
+  "alert_name": "KubePodCrashLooping",
+  "case_id": "c-NORMALIZED",
+  "confidence": 0.82,
+  "dead_ends": [
+    {
+      "ruled_out_by": "request rate was not queried; nothing in the metrics window supports it",
+      "theory": "a traffic spike drove the restarts"
+    }
+  ],
+  "evidence": [
+    {
+      "capture_ref": "mcp/000-query_range.json",
+      "observation": "working set rises to 530MB against a 512Mi limit inside the window",
+      "query": "container_memory_working_set_bytes{namespace=\"shop\",pod=~\"checkout-.*\"}",
+      "tool": "query_range"
+    }
+  ],
+  "firing_since": "2026-07-28T10:05:00Z",
+  "generated_at": "NORMALIZED",
+  "hound": "metrics",
+  "hypothesis": "checkout's working set climbs to its memory limit inside the alert window; the restarts are OOMKills, not a traffic spike.",
+  "labels": {
+    "alertname": "KubePodCrashLooping",
+    "namespace": "shop",
+    "pod": "checkout-7d9f",
+    "severity": "critical"
+  },
+  "onset": "2026-07-28T10:02:00Z",
+  "schema_version": 1,
+  "spend": {
+    "input_tokens": 3600,
+    "output_tokens": 400,
+    "tool_calls": 1,
+    "usd": 0.028,
+    "wall_ms": 0
+  }
+}

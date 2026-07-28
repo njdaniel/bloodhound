@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "case_id": "c-20260728T101500-a1b2c3",
+  "alert_name": "KubePodCrashLooping",
+  "labels": {
+    "alertname": "KubePodCrashLooping",
+    "namespace": "shop",
+    "pod": "checkout-7d9f4c8b6-x2k9p",
+    "severity": "critical"
+  },
+  "firing_since": "2026-07-28T10:05:00Z",
+  "generated_at": "2026-07-28T10:17:42Z",
+  "hound": "metrics",
+  "hypothesis": "checkout is being OOMKilled: its working set climbs to the 512Mi limit about ninety seconds after each start, and the restart count steps up in lockstep. The climb begins at 10:02, three minutes before the alert fired.",
+  "confidence": 0.82,
+  "onset": "2026-07-28T10:02:00Z",
+  "evidence": [
+    {
+      "tool": "query_range",
+      "query": "container_memory_working_set_bytes{namespace=\"shop\",pod=~\"checkout-.*\"}",
+      "observation": "working set rises from 180Mi to the 512Mi limit over 90s, then resets",
+      "capture_ref": "mcp/000-query_range.json"
+    },
+    {
+      "tool": "query_instant",
+      "query": "kube_pod_container_status_restarts_total{namespace=\"shop\"}",
+      "observation": "checkout restarts 14 times in the window; no other pod restarts",
+      "capture_ref": "mcp/001-query_instant.json"
+    }
+  ],
+  "dead_ends": [
+    {
+      "theory": "an upstream dependency started returning errors",
+      "ruled_out_by": "upstream 5xx rate is flat at zero across the whole window"
+    },
+    {
+      "theory": "node-level CPU starvation",
+      "ruled_out_by": "node CPU saturation stays below 40% and no other pod on the node is affected"
+    }
+  ],
+  "spend": {
+    "input_tokens": 31240,
+    "output_tokens": 2210,
+    "usd": 0.0841,
+    "tool_calls": 7,
+    "wall_ms": 162044
+  }
+}

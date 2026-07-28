@@ -1,0 +1,27 @@
+bloodhound report — case c-20260728T101500-a1b2c3
+==============================================================================
+alert:   KubePodCrashLooping
+firing:  2026-07-28T10:05:00Z
+scope:   namespace=shop pod=checkout-7d9f4c8b6-x2k9p severity=critical
+hound:   metrics
+
+HYPOTHESIS  (confidence 0.82)
+onset 2026-07-28T10:02:00Z
+checkout is being OOMKilled: its working set climbs to the 512Mi limit about
+ninety seconds after each start, and the restart count steps up in lockstep.
+The climb begins at 10:02, three minutes before the alert fired.
+
+EVIDENCE
+  #   TOOL           QUERY                          OBSERVED                     CAPTURE
+  1   query_range    container_memory_working_set_… working set rises from 180M… mcp/000-query_range.json
+  2   query_instant  kube_pod_container_status_res… checkout restarts 14 times … mcp/001-query_instant.json
+
+DEAD ENDS
+  - an upstream dependency started returning errors
+    ruled out by: upstream 5xx rate is flat at zero across the whole window
+  - node-level CPU starvation
+    ruled out by: node CPU saturation stays below 40% and no other pod on the
+                  node is affected
+
+------------------------------------------------------------------------------
+spend: 31240 in + 2210 out tokens · $0.0841 · 7 tool calls · 2m42.044s
