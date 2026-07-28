@@ -1,0 +1,13 @@
+{
+  "hound": "metrics",
+  "summary": "checkout pod restarts began at 10:12Z; container_memory_working_set_bytes for checkout-7d9f reached its 512Mi limit two minutes earlier and the OOMKill counter increments at each restart. Memory pressure, not traffic: request rate was flat across the window.",
+  "confidence": 0.82,
+  "onset": "2026-07-28T10:12:00Z",
+  "evidence": "mcp/000-query_range.json",
+  "dead_ends": [
+    {
+      "theory": "a traffic spike drove the restarts",
+      "ruled_out_by": "rate(http_requests_total[5m]) is flat within 3% across the whole window"
+    }
+  ]
+}
