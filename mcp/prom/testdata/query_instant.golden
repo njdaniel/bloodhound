@@ -1,0 +1,1 @@
+{"result_type":"vector","samples":[{"labels":{"namespace":"shop","pod":"checkout-7d9f"},"value":"42.7","timestamp":1753700000},{"labels":{"namespace":"shop","pod":"payments-5c4b"},"value":"3.14159","timestamp":1753700000}],"truncation":{"samples_total":2,"samples_returned":2}}

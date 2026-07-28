@@ -1,0 +1,1 @@
+{"metrics":[{"name":"container_memory_usage_bytes","type":"gauge","help":"Container memory usage in bytes.","labels":{"pod":["checkout-7d9f"]}},{"name":"http_requests_total","type":"counter","help":"Total HTTP requests by pod.","labels":{"namespace":["shop"],"pod":["checkout-7d9f","payments-5c4b"]}}],"truncation":{"metrics_total":2,"metrics_returned":2}}
