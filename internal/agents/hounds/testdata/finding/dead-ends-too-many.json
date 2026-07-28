@@ -1,0 +1,58 @@
+{
+  "hound": "metrics",
+  "summary": "checkout pod restarts began at 10:12Z; container_memory_working_set_bytes for checkout-7d9f reached its 512Mi limit two minutes earlier and the OOMKill counter increments at each restart. Memory pressure, not traffic: request rate was flat across the window.",
+  "confidence": 0.82,
+  "onset": "2026-07-28T10:12:00Z",
+  "evidence": [
+    {
+      "tool": "query_range",
+      "query": "rate(kube_pod_container_status_restarts_total{namespace=\"shop\",pod=~\"checkout-.*\"}[5m])",
+      "observation": "restarts step from 0 to 0.2/s at 10:12Z, sustained through the window",
+      "capture_ref": "mcp/000-query_range.json"
+    },
+    {
+      "tool": "query_range",
+      "query": "container_memory_working_set_bytes{namespace=\"shop\",pod=~\"checkout-.*\"} / container_spec_memory_limit_bytes",
+      "observation": "working set crosses 1.0 of the limit at 10:10Z, two minutes before the first restart",
+      "capture_ref": "mcp/001-query_range.json"
+    }
+  ],
+  "dead_ends": [
+    {
+      "theory": "theory 0",
+      "ruled_out_by": "query 0 showed nothing"
+    },
+    {
+      "theory": "theory 1",
+      "ruled_out_by": "query 1 showed nothing"
+    },
+    {
+      "theory": "theory 2",
+      "ruled_out_by": "query 2 showed nothing"
+    },
+    {
+      "theory": "theory 3",
+      "ruled_out_by": "query 3 showed nothing"
+    },
+    {
+      "theory": "theory 4",
+      "ruled_out_by": "query 4 showed nothing"
+    },
+    {
+      "theory": "theory 5",
+      "ruled_out_by": "query 5 showed nothing"
+    },
+    {
+      "theory": "theory 6",
+      "ruled_out_by": "query 6 showed nothing"
+    },
+    {
+      "theory": "theory 7",
+      "ruled_out_by": "query 7 showed nothing"
+    },
+    {
+      "theory": "theory 8",
+      "ruled_out_by": "query 8 showed nothing"
+    }
+  ]
+}

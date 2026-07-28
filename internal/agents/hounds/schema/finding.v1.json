@@ -1,0 +1,41 @@
+{
+  "$id": "bloodhound/finding/v1",
+  "type": "object",
+  "required": ["hound", "summary", "confidence", "evidence", "dead_ends"],
+  "additionalProperties": false,
+  "properties": {
+    "hound": { "const": "metrics" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1200,
+      "description": "The hypothesis and the shape of the supporting data." },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "onset": { "type": "string", "format": "date-time",
+      "description": "When the anomaly began, if determined." },
+    "evidence": {
+      "type": "array", "maxItems": 12,
+      "items": {
+        "type": "object",
+        "required": ["tool", "query", "observation", "capture_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "tool": { "type": "string" },
+          "query": { "type": "string", "maxLength": 500 },
+          "observation": { "type": "string", "maxLength": 500 },
+          "capture_ref": { "type": "string",
+            "description": "Capture filename under the case work dir, e.g. mcp/003-query_range.json. Injected by the loop, not the model (§3.4)." }
+        }
+      }
+    },
+    "dead_ends": {
+      "type": "array", "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["theory", "ruled_out_by"],
+        "additionalProperties": false,
+        "properties": {
+          "theory": { "type": "string", "maxLength": 300 },
+          "ruled_out_by": { "type": "string", "maxLength": 300 }
+        }
+      }
+    }
+  }
+}
