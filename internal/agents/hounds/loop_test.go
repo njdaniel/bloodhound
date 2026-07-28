@@ -12,9 +12,19 @@ import (
 
 	"github.com/njdaniel/bloodhound/internal/llm"
 	"github.com/njdaniel/bloodhound/internal/llm/llmtest"
+	"github.com/njdaniel/bloodhound/internal/llm/middleware"
 	"github.com/njdaniel/bloodhound/internal/mcpclient"
 	"github.com/njdaniel/bloodhound/internal/orchestrator"
 )
+
+// testDeps builds the Deps a loop test needs: the accounting decorator the
+// loop reads Spend from, wrapping the scripted provider. Production wiring
+// goes through Compose, which puts retry outside accounting and capture
+// inside it; a test needs neither of those layers, only the correct handle.
+func testDeps(p llm.Provider, tools ToolSource) Deps {
+	acct := middleware.NewAccounting(p)
+	return Deps{Provider: acct, Accounting: acct, Tools: tools, Model: "test-model"}
+}
 
 // fakeTools is a scripted ToolSource: it serves fixed tool definitions,
 // records every call, and returns queued results. No server is spawned and no
@@ -192,7 +202,7 @@ func TestRunHappyPath(t *testing.T) {
 	)
 	p.InputUSDPerMTok, p.OutputUSDPerMTok = 3, 15
 
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 	finding, spend, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{})
 	if err != nil {
@@ -299,7 +309,8 @@ func TestRunBudgetExhaustion(t *testing.T) {
 				toolUse("t1", "query_range", `{"query":"up"}`, tt.firstUsage),
 				validSubmit("t2", 1),
 			)
-			deps := Deps{Provider: p, Tools: tools, Model: "test-model", Now: clock.Now}
+			deps := testDeps(p, tools)
+			deps.Now = clock.Now
 			c := testCase()
 
 			finding, spend, err := Run(t.Context(), deps, c, MetricsFocus(c), tt.budget)
@@ -337,7 +348,7 @@ func TestRunStopsSpendingAfterExhaustion(t *testing.T) {
 	tools := newFakeTools(result(`{"series":[]}`, "mcp/000-query_range.json"))
 	query := toolUse("t1", "query_range", `{"query":"up"}`, llm.Usage{InputTokens: 10, OutputTokens: 5})
 	p := llmtest.New(t, query, query, query, query)
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	_, _, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{MaxToolCalls: 1})
@@ -362,7 +373,7 @@ func TestRunRepairsInvalidFinding(t *testing.T) {
 		submit("t2", `{"hound":"metrics","summary":"","confidence":4,"evidence":[],"dead_ends":[]}`),
 		validSubmit("t3", 1),
 	)
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	finding, _, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{})
@@ -397,7 +408,7 @@ func TestRunRepairsInvalidFinding(t *testing.T) {
 func TestRunFailsAfterThreeInvalidSubmissions(t *testing.T) {
 	bad := `{"hound":"metrics","summary":"x","confidence":4,"evidence":[],"dead_ends":[]}`
 	p := llmtest.New(t, submit("t1", bad), submit("t2", bad), submit("t3", bad))
-	deps := Deps{Provider: p, Tools: newFakeTools(), Model: "test-model"}
+	deps := testDeps(p, newFakeTools())
 	c := testCase()
 
 	_, spend, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{})
@@ -423,7 +434,7 @@ func TestRunNudgesThenForcesToolUse(t *testing.T) {
 		prose("To summarize, memory pressure is likely.", llm.Usage{InputTokens: 10, OutputTokens: 5}),
 		validSubmit("t3"),
 	)
-	deps := Deps{Provider: p, Tools: newFakeTools(), Model: "test-model"}
+	deps := testDeps(p, newFakeTools())
 	c := testCase()
 
 	if _, _, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{}); err != nil {
@@ -456,7 +467,7 @@ func TestRunSurfacesMCPToolErrors(t *testing.T) {
 		toolUse("t2", "query_range", `{"query":"up","start":"a","end":"c"}`, llm.Usage{InputTokens: 10, OutputTokens: 5}),
 		validSubmit("t3", 1, 2),
 	)
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	finding, spend, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{})
@@ -485,7 +496,7 @@ func TestRunTransportFailureIsFatal(t *testing.T) {
 	tools := newFakeTools()
 	tools.err = errors.New("broken pipe")
 	p := llmtest.New(t, toolUse("t1", "query_range", `{"query":"up"}`, llm.Usage{}))
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	_, _, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{})
@@ -506,7 +517,7 @@ func TestRunStopsOnContextCancellation(t *testing.T) {
 		toolUse("t1", "query_range", `{"query":"up"}`, llm.Usage{InputTokens: 10, OutputTokens: 5}),
 		validSubmit("t2", 1),
 	)
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	_, spend, err := Run(ctx, deps, c, MetricsFocus(c), orchestrator.Budget{})
@@ -532,7 +543,7 @@ func TestRunRejectsUnknownTool(t *testing.T) {
 		validSubmit("t2"),
 	)
 	tools := newFakeTools()
-	deps := Deps{Provider: p, Tools: tools, Model: "test-model"}
+	deps := testDeps(p, tools)
 	c := testCase()
 
 	if _, spend, err := Run(t.Context(), deps, c, MetricsFocus(c), orchestrator.Budget{}); err != nil {

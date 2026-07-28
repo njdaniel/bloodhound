@@ -23,14 +23,16 @@ const SubmitFindingTool = "submit_finding"
 
 // Budget defaults from spec 002 §3.2. A zero field in the caller's
 // orchestrator.Budget takes the default, so budgets stay config-overridable
-// without every caller restating them.
+// without every caller restating them. The values live in the orchestrator
+// package, which needs the wall-clock cap to size its investigate phase
+// timeout; these are aliases so the two can never drift apart.
 const (
 	// DefaultMaxToolCalls caps MCP tool calls per hound run.
-	DefaultMaxToolCalls = 12
+	DefaultMaxToolCalls = orchestrator.DefaultMaxToolCalls
 	// DefaultMaxTokens caps total (input + output) tokens per hound run.
-	DefaultMaxTokens = 50_000
+	DefaultMaxTokens = orchestrator.DefaultMaxTokens
 	// DefaultMaxWallClock caps a hound run's wall-clock duration.
-	DefaultMaxWallClock = 3 * time.Minute
+	DefaultMaxWallClock = orchestrator.DefaultMaxWallClock
 	// DefaultMaxOutputTokens caps the output of a single model call.
 	DefaultMaxOutputTokens = 4096
 )
@@ -69,13 +71,35 @@ type ToolSource interface {
 // time.
 var _ ToolSource = (*mcpclient.Session)(nil)
 
-// Deps carries the collaborators one hound run needs. The caller owns
-// provider composition: wrap Provider in the capture and retry decorators
-// from internal/llm/middleware before handing it over. The loop adds its own
-// accounting decorator on top so Spend reflects exactly the calls it made.
+// Accountant reports accumulated model usage and cost. *middleware.Accounting
+// implements it; the loop reads Spend through it instead of decorating the
+// provider itself.
+type Accountant interface {
+	// Totals returns usage and cost across every model call so far.
+	Totals() (llm.Usage, llm.Cost)
+}
+
+// The middleware accounting decorator is the production Accountant; this pins
+// the contract so a signature change there fails the build here.
+var _ Accountant = (*middleware.Accounting)(nil)
+
+// Deps carries the collaborators one hound run needs.
+//
+// The caller owns provider composition and must build the stack in the order
+// internal/llm/middleware documents — retry → accounting → capture → provider
+// — handing the outermost decorator in as Provider and the accounting layer in
+// as Accounting. Compose does exactly that. The loop deliberately does not
+// wrap Provider itself: an accounting decorator added here would sit *outside*
+// the caller's retry decorator and would count one retried call once instead
+// of once per attempt, undercounting Spend on exactly the runs that cost the
+// most.
 type Deps struct {
-	// Provider runs model turns. Required.
+	// Provider runs model turns: the outermost decorator of the composed
+	// stack. Required.
 	Provider llm.Provider
+	// Accounting is the accounting layer inside that stack, and the source of
+	// the run's token, cost, and budget numbers. Required.
+	Accounting Accountant
 	// Tools is the hound's MCP session. Required.
 	Tools ToolSource
 	// Model names the model to invoke. Required.
@@ -108,6 +132,9 @@ func runLoop(ctx context.Context, cfg loopConfig, opening string) (orchestrator.
 	if cfg.deps.Provider == nil {
 		return orchestrator.Finding{}, orchestrator.Spend{}, fmt.Errorf("%s-hound: Deps.Provider is required", cfg.hound)
 	}
+	if cfg.deps.Accounting == nil {
+		return orchestrator.Finding{}, orchestrator.Spend{}, fmt.Errorf("%s-hound: Deps.Accounting is required; compose the provider stack with Compose", cfg.hound)
+	}
 	if cfg.deps.Tools == nil {
 		return orchestrator.Finding{}, orchestrator.Spend{}, fmt.Errorf("%s-hound: Deps.Tools is required", cfg.hound)
 	}
@@ -125,7 +152,8 @@ func runLoop(ctx context.Context, cfg loopConfig, opening string) (orchestrator.
 	}
 	budget := withBudgetDefaults(cfg.budget)
 	start := now()
-	acct := middleware.NewAccounting(cfg.deps.Provider)
+	acct := cfg.deps.Accounting
+	provider := cfg.deps.Provider
 
 	// refs holds one capture ref per completed tool call, in call order. The
 	// model cites tool calls 1-based; refs[i-1] is call #i (spec 002 §3.4).
@@ -190,7 +218,7 @@ func runLoop(ctx context.Context, cfg loopConfig, opening string) (orchestrator.
 			choice = llm.ToolChoice{Type: llm.ToolChoiceRequired}
 		}
 
-		resp, err := acct.Complete(ctx, llm.Request{
+		resp, err := provider.Complete(ctx, llm.Request{
 			Model:      cfg.deps.Model,
 			System:     cfg.systemPrompt,
 			Messages:   messages,
@@ -254,18 +282,7 @@ func runLoop(ctx context.Context, cfg loopConfig, opening string) (orchestrator.
 // withBudgetDefaults fills unset budget fields with the spec 002 §3.2
 // defaults. A negative field means the cap is disabled, which only tests and
 // deliberate overrides should ever want.
-func withBudgetDefaults(b orchestrator.Budget) orchestrator.Budget {
-	if b.MaxToolCalls == 0 {
-		b.MaxToolCalls = DefaultMaxToolCalls
-	}
-	if b.MaxTokens == 0 {
-		b.MaxTokens = DefaultMaxTokens
-	}
-	if b.MaxWallClock == 0 {
-		b.MaxWallClock = DefaultMaxWallClock
-	}
-	return b
-}
+func withBudgetDefaults(b orchestrator.Budget) orchestrator.Budget { return b.WithDefaults() }
 
 // exhaustedReason reports which cap the run has hit, or "" if it has room
 // left. Caps are checked in a fixed order so the note is deterministic.

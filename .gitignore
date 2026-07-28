@@ -3,4 +3,5 @@ bin/
 .env
 evals/results/
 cases/
+work/
 .DS_Store
