@@ -1,0 +1,11 @@
+{
+  "seq": 0,
+  "tool": "echo",
+  "args": {
+    "text": "hello"
+  },
+  "result": {
+    "text": "echo: hello",
+    "capture_ref": "mcp/000-echo.json"
+  }
+}
