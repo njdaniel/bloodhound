@@ -120,7 +120,11 @@ otherwise pick automatically.
      deviations from spec, anything discovered that belongs in a new issue.
 4. For each completed worker, run a REVIEWER as a separate subagent with
    fresh eyes (it must not see the worker's reasoning, only the diff):
-   - Input: `git diff main...HEAD`, the issue, the linked spec, CLAUDE.md.
+   - Input: the branch diff against the repo's DEFAULT branch —
+     `git diff origin/HEAD...HEAD`. Never hardcode `main`: this repo's
+     default branch is `master`, and diffing a branch that does not exist
+     either errors or silently hands the reviewer the wrong changeset.
+     Plus the issue, the linked spec, CLAUDE.md.
    - Check: acceptance criteria actually met; spec conformance; correctness
      and edge cases; tests real (assert behavior, not just run); no scope
      creep; conventions followed.
