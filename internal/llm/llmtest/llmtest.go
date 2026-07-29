@@ -4,10 +4,14 @@
 // is exhausted. It is the test substrate for every downstream loop test —
 // no network, no SDK. See specs/002-m1-metrics-path.md §5.
 //
-// Every method is safe to call from any goroutine, including the exhausted
-// path: it reports failure with tb.Errorf, never tb.Fatalf, because Fatalf
-// calls runtime.Goexit, which is only valid on the goroutine running the
-// test. Parallel hounds call Complete from worker goroutines.
+// Every method is safe to call from any goroutine the test outlives,
+// including the exhausted path: it reports failure with tb.Errorf, never
+// tb.Fatalf, because Fatalf calls runtime.Goexit, which is only valid on the
+// goroutine running the test. Parallel hounds call Complete from worker
+// goroutines; join those workers before the test function returns. Reporting
+// a failure from a goroutine that outlives its test panics ("Fail in
+// goroutine after ... has completed") — that is testing's rule, not this
+// package's, and no provider can paper over it.
 package llmtest
 
 import (

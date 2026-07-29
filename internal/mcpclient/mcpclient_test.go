@@ -378,6 +378,7 @@ func TestNextSeqParsesSequencePrefix(t *testing.T) {
 		{"mixed widths", []string{"999-echo.json", "1234-echo.json"}, 1235},
 		{"tool name contains a dash", []string{"012-query-range.json"}, 13},
 		{"no sequence prefix", []string{"notes.json", "-echo.json", "abc-echo.json"}, 0},
+		{"prefix beyond the bound", []string{"10000000000-echo.json"}, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -395,6 +396,36 @@ func TestNextSeqParsesSequencePrefix(t *testing.T) {
 				t.Errorf("nextSeq = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSeqPrefixRejectsOverflowingValues guards the one way the widened parser
+// could be worse than the fixed-width one it replaced: a corrupt or
+// hand-planted name whose digits parse but whose n+1 overflows, wrapping
+// negative so nextSeq ignores it and restarts numbering over live captures.
+// The parse is bounded so that value is unrepresentable.
+func TestSeqPrefixRejectsOverflowingValues(t *testing.T) {
+	for _, name := range []string{
+		"9223372036854775807-echo.json", // math.MaxInt64: n+1 wraps to MinInt64
+		"10000000000-echo.json",         // 1e10: parses on 64-bit, far past any real case
+	} {
+		if n, ok := seqPrefix(name); ok {
+			t.Errorf("seqPrefix(%q) = %d, true; want rejected (bounded parse)", name, n)
+		}
+	}
+	// And through nextSeq: a planted name must not steer live numbering.
+	dir := t.TempDir()
+	for _, name := range []string{"9223372036854775807-echo.json", "007-echo.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("seeding %s: %v", name, err)
+		}
+	}
+	got, err := nextSeq(dir)
+	if err != nil {
+		t.Fatalf("nextSeq: %v", err)
+	}
+	if got != 8 {
+		t.Errorf("nextSeq = %d, want 8 (the planted name is ignored, 007 still counts)", got)
 	}
 }
 

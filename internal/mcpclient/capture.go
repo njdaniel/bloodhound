@@ -86,7 +86,10 @@ func nextSeq(dir string) (int, error) {
 
 // seqPrefix parses the leading run of digits before the first '-' in a
 // capture filename. It reports false for any name that does not start with
-// at least one digit followed by '-'.
+// at least one digit followed by '-', and for values above math.MaxInt32: the
+// bound keeps nextSeq's n+1 from overflowing on a corrupt or hand-planted
+// name, which would wrap negative and silently restart numbering on top of
+// existing captures. ~2e9 is headroom no real case will approach.
 func seqPrefix(name string) (int, bool) {
 	i := strings.IndexByte(name, '-')
 	if i <= 0 {
@@ -98,9 +101,9 @@ func seqPrefix(name string) (int, bool) {
 			return 0, false
 		}
 	}
-	n, err := strconv.Atoi(digits)
+	n, err := strconv.ParseInt(digits, 10, 32)
 	if err != nil {
 		return 0, false
 	}
-	return n, true
+	return int(n), true
 }
