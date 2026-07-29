@@ -165,10 +165,13 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 		series = append(series, r.series)
 	}
 
-	var dropNote string
+	// One sentence per applied cap, in the order §2.3 applies them. The
+	// series cap is settled here; the size backstop below appends to it.
+	var notes []string
 	if total > MaxSeries {
-		dropNote = fmt.Sprintf("%d series dropped; ranked by (max-min) descending. Narrow the selector to see specific series.", total-MaxSeries)
+		notes = append(notes, fmt.Sprintf("%d series dropped; ranked by (max-min) descending. Narrow the selector to see specific series.", total-MaxSeries))
 	}
+	preSizeNotes := len(notes) // notes[:preSizeNotes] survive every backstop pass
 	res := rangeResult{
 		ResolvedStepSeconds: step,
 		Series:              series,
@@ -176,7 +179,7 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			SeriesTotal:    total,
 			SeriesReturned: len(series),
 			PointsThinned:  false,
-			Note:           dropNote,
+			Note:           joinNotes(notes...),
 		},
 	}
 
@@ -201,11 +204,25 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			}
 		}
 		if !changed {
-			break // nothing left to thin; ship what we have
+			// Every series is down to its first and last point and the
+			// payload still does not fit, so it ships oversized. Say so:
+			// an unmarked overflow is the one thing §2.1 rules out, because
+			// the model would read a capped result as a complete one. The
+			// note itself adds bytes to an already-oversized payload, which
+			// is the cheaper of the two costs.
+			notes = append(notes, fmt.Sprintf("Result exceeds the %d KiB response cap and cannot be thinned further (at most %d points per series remain); it is returned oversized. Narrow the selector or the window.",
+				MaxResponseBytes/1024, maxPts))
+			res.Truncation.Note = joinNotes(notes...)
+			payload, err = json.Marshal(res)
+			if err != nil {
+				return nil, nil, fmt.Errorf("serializing oversized query_range result: %w", err)
+			}
+			break
 		}
 		res.Truncation.PointsThinned = true
-		res.Truncation.Note = joinNotes(dropNote,
-			fmt.Sprintf("Points thinned to at most %d per series to fit the 32 KiB response cap; first and last points kept; stats reflect full resolution.", maxPts))
+		notes = append(notes[:preSizeNotes],
+			fmt.Sprintf("Points thinned to at most %d per series to fit the %d KiB response cap; first and last points kept; stats reflect full resolution.", maxPts, MaxResponseBytes/1024))
+		res.Truncation.Note = joinNotes(notes...)
 		payload, err = json.Marshal(res)
 		if err != nil {
 			return nil, nil, fmt.Errorf("serializing thinned query_range result: %w", err)

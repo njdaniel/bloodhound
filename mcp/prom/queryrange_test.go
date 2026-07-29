@@ -311,6 +311,74 @@ func TestQueryRangeCollidingLabelsetsRankDeterministically(t *testing.T) {
 	}
 }
 
+// TestQueryRangeMarksOversizedPayloadAfterThinning covers the size backstop's
+// dead end: series whose label sets alone blow the 32 KiB cap, so thinning
+// runs out of points before the payload fits. The result ships oversized —
+// there is nothing left to drop — and spec 002 §2.1 requires it to say so
+// rather than pass for a complete result.
+func TestQueryRangeMarksOversizedPayloadAfterThinning(t *testing.T) {
+	// 15 series x 30 labels x 120-byte values is well over 32 KiB with only
+	// two points each, so no amount of thinning helps.
+	fixture := func(nPoints int) string {
+		var series []map[string]any
+		for i := 0; i < MaxSeries; i++ {
+			labels := map[string]string{"pod": fmt.Sprintf("checkout-%02d", i)}
+			for k := 0; k < 30; k++ {
+				labels[fmt.Sprintf("label_%02d", k)] = strings.Repeat("v", MaxStringLen)
+			}
+			values := make([][2]any, 0, nPoints)
+			for p := 0; p < nPoints; p++ {
+				values = append(values, [2]any{1753700000 + p*30, fmt.Sprintf("%d", i+p)})
+			}
+			series = append(series, seriesFixture(labels, values))
+		}
+		return matrixJSON(t, series)
+	}
+	tests := []struct {
+		name        string
+		nPoints     int
+		wantThinned bool
+	}{
+		// Already at the two-point floor: the very first backstop pass has
+		// nothing to thin and must still mark the overflow.
+		{"nothing left to thin", 2, false},
+		// Thins down to the floor over several passes, then gives up: both
+		// the thinning and the overflow have to be recorded.
+		{"thinned to the floor and still too big", 33, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeProm(t)
+			fake.set("/api/v1/query_range", 200, fixture(tc.nPoints))
+			res, _, err := newTestToolServer(fake).handleQueryRange(context.Background(), nil, queryRangeInput{
+				Query: "up", Start: "2026-07-28T10:00:00Z", End: "2026-07-28T11:00:00Z",
+			})
+			if err != nil {
+				t.Fatalf("handleQueryRange: %v", err)
+			}
+			payload := resultText(t, res)
+			if len(payload) <= MaxResponseBytes {
+				t.Fatalf("fixture serialized to %d bytes; it must exceed the %d-byte cap to reach the dead end", len(payload), MaxResponseBytes)
+			}
+			g := decodeRange(t, res)
+			if g.Truncation.PointsThinned != tc.wantThinned {
+				t.Errorf("points_thinned = %v, want %v", g.Truncation.PointsThinned, tc.wantThinned)
+			}
+			if !strings.Contains(g.Truncation.Note, "exceeds") || !strings.Contains(g.Truncation.Note, "32 KiB") {
+				t.Errorf("truncation note %q does not record that the response cap was exceeded", g.Truncation.Note)
+			}
+			if tc.wantThinned && !strings.Contains(g.Truncation.Note, "Points thinned") {
+				t.Errorf("truncation note %q dropped the thinning sentence it had already earned", g.Truncation.Note)
+			}
+			for i, s := range g.Series {
+				if len(s.Points) >= tc.nPoints && tc.wantThinned {
+					t.Fatalf("series %d kept %d of %d points; the backstop stopped short", i, len(s.Points), tc.nPoints)
+				}
+			}
+		})
+	}
+}
+
 func TestQueryRangeRangeLimitError(t *testing.T) {
 	ts := newTestToolServer(newFakeProm(t))
 	_, _, err := ts.handleQueryRange(context.Background(), nil, queryRangeInput{

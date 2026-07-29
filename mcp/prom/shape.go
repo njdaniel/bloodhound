@@ -160,8 +160,11 @@ func thinPoints(pts []point) ([]point, bool) {
 }
 
 // joinNotes assembles a truncation note from its parts, skipping empties.
+// It does not modify parts: query_range calls it on a note slice it keeps
+// appending to across size-backstop passes, and compacting in place would
+// rewrite that caller's slice under it.
 func joinNotes(parts ...string) string {
-	kept := parts[:0]
+	kept := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if p != "" {
 			kept = append(kept, p)
