@@ -476,10 +476,23 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 	}
 	// Whether the server truncated is answered by the warnings, not by the
 	// result count: a server old enough to ignore limit returns everything,
-	// and counting would then claim a drop that never happened. Truncation is
-	// the only condition that warns on this endpoint, and treating an unknown
-	// warning as "possibly partial" errs toward telling the model.
-	seriesCapped := len(warnings) > 0
+	// and counting would then claim a drop that never happened.
+	//
+	// Only a truncation warning may produce the truncation sentence. Other
+	// warnings are real but different problems — "store(s) unavailable;
+	// partial response" from a Thanos/Cortex backend or a failing remote_read
+	// — and blaming those on the series limit hands the model a fabricated
+	// cause and useless advice. They are passed through verbatim instead,
+	// which is something it can actually act on.
+	var seriesCapped bool
+	var otherWarnings []string
+	for _, w := range warnings {
+		if strings.Contains(strings.ToLower(w), "truncated") {
+			seriesCapped = true
+			continue
+		}
+		otherWarnings = append(otherWarnings, w)
+	}
 
 	byMetric := map[string]map[string]map[string]bool{} // metric → label key → value set
 	for _, set := range sets {
@@ -513,21 +526,17 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 	if err != nil {
 		return nil, nil, err
 	}
-	// /api/v1/metadata does not warn when it truncates, and it fills its map
-	// by walking active targets until the limit, so which metrics survive is
-	// arbitrary and can differ between two calls. A full map therefore has to
-	// be read as "possibly truncated": without saying so, an empty type/help
-	// reads as "no metadata registered for this metric", which before the
-	// limit was an unambiguous fact.
-	metadataCapped := len(meta) >= MaxUpstreamMetadata
-
 	valuesCapped := false
+	metaIncomplete := false
 	metrics := make([]metricMeta, 0, len(names))
 	for _, name := range names {
 		m := metricMeta{Name: name, Labels: map[string][]string{}}
 		if entries := meta[name]; len(entries) > 0 {
 			m.Type = entries[0].Type
 			m.Help = truncateString(entries[0].Help, MaxStringLen)
+		}
+		if m.Type == "" || m.Help == "" {
+			metaIncomplete = true
 		}
 		for key, valueSet := range byMetric[name] {
 			values := make([]string, 0, len(valueSet))
@@ -547,6 +556,16 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 		metrics = append(metrics, m)
 	}
 
+	// /api/v1/metadata does not warn when it truncates, and it fills its map
+	// by walking active targets until the limit, so which metrics survive is
+	// arbitrary and can differ between two calls. A full map is therefore
+	// read as "possibly truncated" — but only worth saying when something in
+	// the result actually lacks type or help, since that is the only reading
+	// the cap can have corrupted (it used to mean "not registered", full
+	// stop). Gating on it also removes the false positive on a server holding
+	// exactly MaxUpstreamMetadata metrics.
+	metadataCapped := len(meta) >= MaxUpstreamMetadata && metaIncomplete
+
 	// Every cap that was applied gets its own sentence; the advice they share
 	// is appended once, so a doubly-capped result does not repeat it.
 	var notes []string
@@ -565,6 +584,11 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 	}
 	if metricsDropped || seriesCapped {
 		notes = append(notes, "Narrow the match selector.")
+	}
+	if len(otherWarnings) > 0 {
+		// Verbatim, so the model sees the backend's own words, but bounded
+		// like every other string this server emits.
+		notes = append(notes, "Prometheus warned: "+truncateString(strings.Join(otherWarnings, "; "), MaxStringLen)+".")
 	}
 	payload, err := json.Marshal(metadataResult{
 		Metrics: metrics,

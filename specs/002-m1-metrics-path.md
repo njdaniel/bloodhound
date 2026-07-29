@@ -157,14 +157,19 @@ Three consequences, all deliberate, all marked:
   metrics. Detected from the response's `warnings` (`"results truncated due to
   limit"`), **not** from the result count: a server old enough to ignore
   `limit` returns everything, and counting would report a truncation that
-  never happened. Marked in `truncation.note`.
+  never happened. Only a warning that says *truncated* produces that note;
+  any other warning (a Thanos/Cortex partial response, a failing
+  `remote_read`) is surfaced verbatim instead, since blaming it on the series
+  limit would give the model a fabricated cause and advice that cannot help.
+  Marked in `truncation.note`.
 - When the server honours the metadata limit, metrics come back with an empty
   `type` and `help`. `/api/v1/metadata` does not warn, and it fills its map by
   walking active targets until the limit, so *which* metrics keep their
   metadata is arbitrary and can differ between two calls. A full map is
-  therefore reported as possibly truncated — otherwise an empty `type`/`help`,
-  which used to mean "no metadata registered", becomes a nondeterministic
-  maybe on exactly the large Prometheus these bounds exist for.
+  therefore reported as possibly truncated, but only when a returned metric is
+  actually missing its `type` or `help` — otherwise that empty field, which
+  used to mean "no metadata registered", becomes a nondeterministic maybe on
+  exactly the large Prometheus these bounds exist for.
 
 The truncation note joins one sentence per applied cap and appends the advice
 they share ("Narrow the match selector.") once.

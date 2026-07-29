@@ -199,11 +199,14 @@ ignored by Prometheus versions that predate it; the client-side caps are what
 guarantee a bounded result.
 
 Both upstream caps are marked in `truncation.note` when they bite. The series
-cap is detected from the response's `warnings`, not from the result count, so
-a server that ignores `limit` is never reported as having truncated. The
-metadata cap has no warning to read, so a full metadata map is reported as
-possibly truncated: an empty `type`/`help` then means "not fetched" rather
-than "not registered".
+cap is detected from a *truncation* warning in the response, not from the
+result count, so a server that ignores `limit` is never reported as having
+truncated — and warnings that mean something else (a Thanos/Cortex partial
+response, a failing `remote_read`) are passed through verbatim rather than
+blamed on the limit. The metadata cap has no warning to read, so a full
+metadata map is reported as possibly truncated, but only when a returned
+metric is actually missing its `type` or `help`: that empty field may then
+mean "not fetched" rather than "not registered".
 
 ## Tests
 
