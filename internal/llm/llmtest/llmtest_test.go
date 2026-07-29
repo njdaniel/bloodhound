@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/njdaniel/bloodhound/internal/llm"
@@ -67,6 +69,71 @@ func TestExhaustedQueueReturnsErrorWithoutTB(t *testing.T) {
 	}
 	if len(p.Requests()) != 1 {
 		t.Errorf("recorded %d requests, want 1 (exhausted calls are recorded too)", len(p.Requests()))
+	}
+}
+
+// fakeTB stands in for *testing.T so the exhausted path can be exercised
+// without failing the real test. Fatalf mimics testing.T faithfully: it ends
+// the calling goroutine via runtime.Goexit.
+type fakeTB struct {
+	testing.TB
+	mu      sync.Mutex
+	errorfs int
+	fatalfs int
+}
+
+func (f *fakeTB) Helper() {}
+
+func (f *fakeTB) Errorf(string, ...any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errorfs++
+}
+
+func (f *fakeTB) Fatalf(string, ...any) {
+	f.mu.Lock()
+	f.fatalfs++
+	f.mu.Unlock()
+	runtime.Goexit()
+}
+
+func (f *fakeTB) counts() (errorfs, fatalfs int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.errorfs, f.fatalfs
+}
+
+// TestExhaustedQueueReturnsOffTestGoroutine pins the M2 requirement: parallel
+// hounds call Complete from worker goroutines, where tb.Fatalf's
+// runtime.Goexit would strand the worker mid-call instead of failing the test.
+func TestExhaustedQueueReturnsOffTestGoroutine(t *testing.T) {
+	tb := &fakeTB{}
+	p := New(tb)
+
+	var (
+		returned bool
+		err      error
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done) // runs even if Complete calls runtime.Goexit
+		_, err = p.Complete(context.Background(), llm.Request{})
+		returned = true
+	}()
+	<-done
+
+	if !returned {
+		t.Fatal("Complete never returned: the exhausted path called tb.Fatalf, whose runtime.Goexit is invalid off the test goroutine")
+	}
+	if !errors.Is(err, ErrExhausted) {
+		t.Errorf("err = %v, want ErrExhausted", err)
+	}
+	errorfs, fatalfs := tb.counts()
+	if fatalfs != 0 {
+		t.Errorf("tb.Fatalf called %d times, want 0", fatalfs)
+	}
+	if errorfs != 1 {
+		t.Errorf("tb.Errorf called %d times, want 1 (exhaustion must still fail the test)", errorfs)
 	}
 }
 

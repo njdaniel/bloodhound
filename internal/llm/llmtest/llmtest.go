@@ -1,8 +1,13 @@
 // Package llmtest provides a scripted llm.Provider for tests: it is
 // constructed with a queue of canned responses, records every request it
-// receives, and fails the test (or returns an error) when the queue is
-// exhausted. It is the test substrate for every downstream loop test —
+// receives, and marks the test failed (and returns an error) when the queue
+// is exhausted. It is the test substrate for every downstream loop test —
 // no network, no SDK. See specs/002-m1-metrics-path.md §5.
+//
+// Every method is safe to call from any goroutine, including the exhausted
+// path: it reports failure with tb.Errorf, never tb.Fatalf, because Fatalf
+// calls runtime.Goexit, which is only valid on the goroutine running the
+// test. Parallel hounds call Complete from worker goroutines.
 package llmtest
 
 import (
@@ -14,8 +19,7 @@ import (
 	"github.com/njdaniel/bloodhound/internal/llm"
 )
 
-// ErrExhausted is returned by Complete when the response queue is empty and
-// no testing.TB was provided to fail the test directly.
+// ErrExhausted is returned by Complete when the response queue is empty.
 var ErrExhausted = errors.New("llmtest: response queue exhausted")
 
 // Provider is a scripted llm.Provider. Each Complete call records the request
@@ -34,8 +38,8 @@ type Provider struct {
 }
 
 // New builds a scripted provider that serves responses in order. tb may be
-// nil; if set, an exhausted queue fails the test via tb.Fatalf, otherwise
-// Complete returns ErrExhausted.
+// nil; if set, an exhausted queue marks the test failed via tb.Errorf.
+// Complete returns ErrExhausted either way.
 func New(tb testing.TB, responses ...llm.Response) *Provider {
 	if tb != nil {
 		tb.Helper()
@@ -43,14 +47,18 @@ func New(tb testing.TB, responses ...llm.Response) *Provider {
 	return &Provider{tb: tb, queue: append([]llm.Response(nil), responses...)}
 }
 
-// Complete records the request and returns the next canned response.
+// Complete records the request and returns the next canned response. An
+// exhausted queue marks the test failed with tb.Errorf and returns
+// ErrExhausted; it never calls tb.Fatalf, whose runtime.Goexit would be
+// invalid on a non-test goroutine and would strand the caller mid-call.
 func (p *Provider) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, req)
 	if len(p.queue) == 0 {
+		n := len(p.requests)
 		p.mu.Unlock()
 		if p.tb != nil {
-			p.tb.Fatalf("llmtest: response queue exhausted after %d requests", len(p.Requests()))
+			p.tb.Errorf("llmtest: response queue exhausted after %d requests", n)
 		}
 		return llm.Response{}, ErrExhausted
 	}
