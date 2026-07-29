@@ -33,8 +33,8 @@ const (
 var ErrBadAlert = errors.New("orchestrator: unusable alert file")
 
 // ErrBudgetExhausted reports that spend already recorded in this case's
-// checkpoints leaves no budget for the phase about to run. It is what stops a
-// crash loop from multiplying cost across resumes (spec 002 §4.3).
+// checkpoints for the phase about to run leaves it no budget. It is what stops
+// a crash loop from multiplying cost across resumes (spec 002 §4.3).
 var ErrBudgetExhausted = errors.New("orchestrator: budget exhausted by prior attempts")
 
 // ErrPipelineMismatch reports that the case being resumed records a different
@@ -271,8 +271,18 @@ type run struct {
 	// the next resume's budget both read.
 	carried map[Phase]Spend
 	// prior is the spend of every checkpoint on disk plus every phase this
-	// walk has run: what the case has cost so far.
+	// walk has run: what the case has cost so far. It is the case total —
+	// `bloodhound cost` and the report's spend footer — not a budget input.
 	prior Spend
+	// priorByPhase is that same spend split by the phase that incurred it. A
+	// phase budget is charged from its own entry rather than from prior,
+	// because prior conflates per-phase accounting with per-agent accounting:
+	// tokens and tool calls only accrue in investigate, but wall clock accrues
+	// in every phase, so charging the hound's wall-clock cap from the case
+	// total bills the hound for intake and report as well. Crash-loop
+	// protection is unaffected — a re-run is still charged for that phase's
+	// own failed attempts (spec 002 §4.3).
+	priorByPhase map[Phase]Spend
 	// phaseSpend is set by a phase to report what it consumed, and consumed
 	// by runPhase when it writes the checkpoint.
 	phaseSpend Spend
@@ -284,7 +294,8 @@ type run struct {
 
 // loadCheckpoints reads the case's checkpoints, adopting the outputs of
 // completed phases and charging all recorded spend — failed attempts
-// included — against the remaining budget.
+// included — to the phase that incurred it, so the next attempt at a phase
+// starts from the budget its own prior attempts left.
 func (r *run) loadCheckpoints() error {
 	cps, err := LoadCheckpoints(r.c.WorkDir)
 	if err != nil {
@@ -292,8 +303,10 @@ func (r *run) loadCheckpoints() error {
 	}
 	r.completed = make(map[Phase]Checkpoint, len(cps))
 	r.carried = make(map[Phase]Spend, len(cps))
+	r.priorByPhase = make(map[Phase]Spend, len(cps))
 	for _, cp := range cps {
 		r.prior = r.prior.Add(cp.Spend)
+		r.priorByPhase[cp.Phase] = r.priorByPhase[cp.Phase].Add(cp.Spend)
 		if cp.Status == StatusCompleted {
 			r.completed[cp.Phase] = cp
 			continue
@@ -310,6 +323,9 @@ func (o *Orchestrator) run(ctx context.Context, r *run) (Result, error) {
 	}
 	if r.carried == nil {
 		r.carried = map[Phase]Spend{}
+	}
+	if r.priorByPhase == nil {
+		r.priorByPhase = map[Phase]Spend{}
 	}
 	for i, phase := range o.walk {
 		index := i + 1
@@ -394,6 +410,7 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	spend := r.phaseSpend
 	spend.WallMS = finished.Sub(started).Milliseconds()
 	r.prior = r.prior.Add(spend)
+	r.priorByPhase[phase] = r.priorByPhase[phase].Add(spend)
 
 	cp := Checkpoint{
 		SchemaVersion: CheckpointSchemaVersion,
@@ -494,8 +511,14 @@ func (o *Orchestrator) phaseIntake(ctx context.Context, r *run) (any, error) {
 
 // phaseInvestigate runs the hound against the remaining budget and returns the
 // Finding as the checkpoint output.
+//
+// The budget is charged from investigate-phase spend only, not the case total:
+// Options.Budget caps one hound run, and wall clock the case spent parsing the
+// alert or rendering a report is not the hound's to answer for. Prior
+// *investigate* spend is still charged, which is what keeps a crash loop from
+// multiplying cost (spec 002 §4.3).
 func (o *Orchestrator) phaseInvestigate(ctx context.Context, r *run) (any, error) {
-	budget, err := remainingBudget(o.opts.Budget, r.prior)
+	budget, err := remainingBudget(o.opts.Budget, r.priorByPhase[PhaseInvestigate])
 	if err != nil {
 		return nil, err
 	}
@@ -533,10 +556,12 @@ func (o *Orchestrator) phaseReport(ctx context.Context, r *run) (any, error) {
 	return ReportOutput{Artifacts: names}, nil
 }
 
-// remainingBudget subtracts spend already recorded for this case from the
-// configured budget. A cap that is already used up fails the phase instead of
+// remainingBudget subtracts spend already recorded for a phase from the budget
+// configured for it. A cap that is already used up fails the phase instead of
 // handing the hound a zero budget, which would silently mean "default"
 // (spec 002 §4.3). Negative caps are disabled and pass through untouched.
+//
+// spent is that phase's own spend, not the case total — see phaseInvestigate.
 func remainingBudget(b Budget, spent Spend) (Budget, error) {
 	out := b
 	if b.MaxTokens > 0 {
