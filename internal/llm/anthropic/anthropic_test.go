@@ -3,6 +3,7 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	sdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 
 	"github.com/njdaniel/bloodhound/internal/llm"
@@ -284,6 +286,79 @@ func TestCompleteSurfacesAPIErrorsWithoutRetrying(t *testing.T) {
 	}
 	if fake.hits != 1 {
 		t.Errorf("hits = %d, want 1 — SDK retries must be disabled (retry policy lives in middleware)", fake.hits)
+	}
+}
+
+// TestCompleteTranslatesAPIErrors pins the provider boundary: the SDK's error
+// type stops here, converted into llm.APIError so that retry policy never has
+// to know which backend failed. The status must survive the translation — it
+// is the whole basis of the transient/permanent decision.
+func TestCompleteTranslatesAPIErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		wantTransient bool
+	}{
+		{"rate limited", http.StatusTooManyRequests, true},
+		{"server error", http.StatusInternalServerError, true},
+		{"overloaded", 529, true},
+		{"bad request", http.StatusBadRequest, false},
+		{"unauthorized", http.StatusUnauthorized, false},
+		{"not found", http.StatusNotFound, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := newFakeAPI(t, `{"type":"error","error":{"type":"api_error","message":"boom"}}`)
+			fake.statuses = []int{tt.status}
+			p := fake.provider(Config{Model: "claude-test-1"})
+
+			_, err := p.Complete(context.Background(), llm.Request{
+				MaxTokens: 64,
+				Messages:  []llm.Message{llm.UserMessage(llm.TextBlock("x"))},
+			})
+			var apiErr *llm.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v (%T), want it to carry an *llm.APIError", err, err)
+			}
+			if apiErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tt.status)
+			}
+			if apiErr.Provider != "anthropic" {
+				t.Errorf("Provider = %q, want anthropic", apiErr.Provider)
+			}
+			if got := apiErr.Transient(); got != tt.wantTransient {
+				t.Errorf("Transient() = %v, want %v", got, tt.wantTransient)
+			}
+			// The SDK error stays reachable underneath: translation adds a
+			// provider-agnostic layer, it does not throw detail away.
+			var sdkErr *sdk.Error
+			if !errors.As(err, &sdkErr) {
+				t.Errorf("err = %v, want the underlying *sdk.Error to remain reachable", err)
+			}
+		})
+	}
+}
+
+// TestCompleteLeavesNonAPIErrorsAlone: transport failures never reached the
+// API, so they carry no status. Labelling them as API errors would invent one.
+func TestCompleteLeavesNonAPIErrorsAlone(t *testing.T) {
+	// A server that is closed before use: the request fails at dial time.
+	closed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := closed.URL
+	closed.Close()
+
+	p := New(Config{Model: "claude-test-1"},
+		option.WithBaseURL(url), option.WithAPIKey("test-key-not-real"))
+	_, err := p.Complete(context.Background(), llm.Request{
+		MaxTokens: 64,
+		Messages:  []llm.Message{llm.UserMessage(llm.TextBlock("x"))},
+	})
+	if err == nil {
+		t.Fatal("Complete succeeded against a closed server")
+	}
+	var apiErr *llm.APIError
+	if errors.As(err, &apiErr) {
+		t.Errorf("dial failure became %v; a transport error has no HTTP status", apiErr)
 	}
 }
 

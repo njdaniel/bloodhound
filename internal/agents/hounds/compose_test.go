@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	sdk "github.com/anthropics/anthropic-sdk-go"
-
 	"github.com/njdaniel/bloodhound/internal/llm"
 	"github.com/njdaniel/bloodhound/internal/llm/middleware"
 	"github.com/njdaniel/bloodhound/internal/orchestrator"
@@ -45,18 +43,14 @@ func (p *flakyProvider) Complete(context.Context, llm.Request) (llm.Response, er
 	return resp, nil
 }
 
-// rateLimited builds an Anthropic 429 the retry decorator recognizes as
-// transient. The SDK error renders itself from the request and response, so
-// both have to be present for the capture middleware to record it.
+// rateLimited builds the provider-agnostic 429 the retry decorator recognizes
+// as transient. Providers translate their client library's errors into this at
+// their own boundary, so a fake provider produces it directly.
 func rateLimited() error {
-	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
-	if err != nil {
-		panic("building a static request: " + err.Error())
-	}
-	return &sdk.Error{
+	return &llm.APIError{
+		Provider:   "flaky",
 		StatusCode: http.StatusTooManyRequests,
-		Request:    req,
-		Response:   &http.Response{StatusCode: http.StatusTooManyRequests},
+		Message:    "rate limited",
 	}
 }
 

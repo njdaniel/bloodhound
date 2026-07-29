@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	sdk "github.com/anthropics/anthropic-sdk-go"
-
 	"github.com/njdaniel/bloodhound/internal/llm"
 )
 
@@ -42,9 +40,20 @@ func (timeoutErr) Error() string   { return "dial: i/o timeout" }
 func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return true }
 
+// apiErr builds the provider-agnostic API error a provider is expected to
+// produce at its boundary. Deliberately not an Anthropic SDK error: this
+// package must classify failures without knowing which backend they came from.
 func apiErr(status int) error {
-	return &sdk.Error{StatusCode: status}
+	return &llm.APIError{Provider: "test-backend", StatusCode: status}
 }
+
+// selfClassifyingErr is a provider error that answers llm.TransientError
+// directly rather than by carrying an HTTP status — the shape a non-HTTP
+// backend would use.
+type selfClassifyingErr struct{ transient bool }
+
+func (selfClassifyingErr) Error() string     { return "backend said so" }
+func (e selfClassifyingErr) Transient() bool { return e.transient }
 
 func TestTransientClassification(t *testing.T) {
 	tests := []struct {
@@ -60,8 +69,27 @@ func TestTransientClassification(t *testing.T) {
 		{"unauthorized 401", apiErr(401), false},
 		{"not found 404", apiErr(404), false},
 		{"request too large 413", apiErr(413), false},
+		{"service unavailable 503", apiErr(503), true},
 		{"wrapped 429", fmt.Errorf("calling api: %w", apiErr(429)), true},
 		{"wrapped 400", fmt.Errorf("calling api: %w", apiErr(400)), false},
+		{"self-classified transient", selfClassifyingErr{transient: true}, true},
+		{"self-classified permanent", selfClassifyingErr{transient: false}, false},
+		// A self-classifying error that says "not transient" must not shadow
+		// a timeout it wraps: the status-less APIError a provider builds
+		// around a dial timeout is exactly the silent non-retry this
+		// classification was made provider-agnostic to prevent.
+		{"no status wrapping a timeout",
+			&llm.APIError{Provider: "ollama", Err: timeoutErr{}}, true},
+		{"no status wrapping a context deadline",
+			&llm.APIError{Provider: "ollama", Err: context.DeadlineExceeded}, true},
+		{"no status wrapping a non-timeout error",
+			&llm.APIError{Provider: "ollama", Err: errors.New("malformed response")}, false},
+		{"permanent status wrapping a non-timeout error",
+			&llm.APIError{Provider: "ollama", StatusCode: 404, Err: errors.New("no such model")}, false},
+		// An error wrapping two causes makes errors.As walk a tree, not a
+		// chain; the API error hiding in the second branch still counts.
+		{"429 in the second of two wrapped causes",
+			fmt.Errorf("giving up (%w): %w", errors.New("context"), apiErr(429)), true},
 		{"network timeout", timeoutErr{}, true},
 		{"wrapped network timeout", fmt.Errorf("calling api: %w", timeoutErr{}), true},
 		{"context canceled", context.Canceled, false},
@@ -130,6 +158,59 @@ func TestRetryRecoversFromTransientErrors(t *testing.T) {
 	}
 }
 
+// TestRetryRetriesNonAnthropicProvider is the regression this package's
+// provider-agnostic classification exists for. A second backend — here a
+// stand-in for the Ollama provider (spec 001 §3.3) — reports a 503 as an
+// llm.APIError, never as an Anthropic SDK error. Classification keyed on one
+// provider's SDK type would silently never retry it, which shows up as
+// unexplained flakiness rather than a visible failure.
+func TestRetryRetriesNonAnthropicProvider(t *testing.T) {
+	unavailable := &llm.APIError{
+		Provider:   "ollama",
+		StatusCode: 503,
+		Message:    "model is loading",
+	}
+	stub := &stubProvider{
+		errs: []error{
+			fmt.Errorf("calling ollama chat API: %w", unavailable),
+			fmt.Errorf("calling ollama chat API: %w", unavailable),
+		},
+		resp: llm.Response{StopReason: llm.StopEndTurn},
+	}
+	r := NewRetry(stub, RetryConfig{MaxAttempts: 3})
+	var delays []time.Duration
+	r.sleep = noSleep(&delays)
+
+	resp, err := r.Complete(context.Background(), llm.Request{})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.StopReason != llm.StopEndTurn {
+		t.Errorf("StopReason = %q, want end_turn", resp.StopReason)
+	}
+	if stub.calls != 3 {
+		t.Errorf("calls = %d, want 3 — a non-Anthropic 503 must be retried", stub.calls)
+	}
+}
+
+// TestRetryDoesNotRetryNonAnthropicPermanentError is the other half: the same
+// provider's 4xx must still stop after one attempt.
+func TestRetryDoesNotRetryNonAnthropicPermanentError(t *testing.T) {
+	permanent := &llm.APIError{Provider: "ollama", StatusCode: 404, Message: "model not found"}
+	stub := &stubProvider{errs: []error{fmt.Errorf("calling ollama chat API: %w", permanent)}}
+	r := NewRetry(stub, RetryConfig{})
+	var delays []time.Duration
+	r.sleep = noSleep(&delays)
+
+	_, err := r.Complete(context.Background(), llm.Request{})
+	if !errors.Is(err, permanent) {
+		t.Fatalf("err = %v, want the original permanent error", err)
+	}
+	if stub.calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retries on 4xx)", stub.calls)
+	}
+}
+
 func TestRetryBackoffIsCapped(t *testing.T) {
 	stub := &stubProvider{
 		errs: []error{apiErr(500), apiErr(500), apiErr(500), apiErr(500)},
@@ -174,7 +255,7 @@ func TestRetryExhaustsAttempts(t *testing.T) {
 	if err == nil {
 		t.Fatal("Complete succeeded, want exhaustion error")
 	}
-	var apiE *sdk.Error
+	var apiE *llm.APIError
 	if !errors.As(err, &apiE) || apiE.StatusCode != 429 {
 		t.Errorf("err = %v, want wrapped 429", err)
 	}

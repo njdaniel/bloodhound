@@ -1,12 +1,15 @@
 // Package anthropic implements llm.Provider on top of the official
 // github.com/anthropics/anthropic-sdk-go client. Model name and pricing come
 // from Config, not from call sites. The SDK's built-in retries are disabled so
-// that retry policy lives in exactly one place: the middleware package.
+// that retry policy lives in exactly one place: the middleware package. API
+// failures are translated into llm.APIError here, at the boundary, so that
+// retry policy stays provider-agnostic.
 package anthropic
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
@@ -14,6 +17,10 @@ import (
 
 	"github.com/njdaniel/bloodhound/internal/llm"
 )
+
+// providerName is this provider's llm.Provider name, also stamped onto the
+// llm.APIError values it produces.
+const providerName = "anthropic"
 
 // Config selects the model and its pricing. Prices are dollars per million
 // tokens, matching how Anthropic publishes them.
@@ -44,7 +51,7 @@ func New(cfg Config, opts ...option.RequestOption) *Provider {
 }
 
 // Name identifies this provider.
-func (p *Provider) Name() string { return "anthropic" }
+func (p *Provider) Name() string { return providerName }
 
 // CountCost prices usage with the per-model rates from Config.
 func (p *Provider) CountCost(u llm.Usage) llm.Cost {
@@ -62,9 +69,30 @@ func (p *Provider) Complete(ctx context.Context, req llm.Request) (llm.Response,
 	}
 	msg, err := p.client.Messages.New(ctx, params)
 	if err != nil {
-		return llm.Response{}, fmt.Errorf("calling anthropic messages API: %w", err)
+		return llm.Response{}, fmt.Errorf("calling anthropic messages API: %w", translateError(err))
 	}
 	return translateResponse(msg), nil
+}
+
+// translateError converts an SDK API error into the provider-agnostic
+// llm.APIError, so retry policy can classify Anthropic failures without
+// importing the SDK. This is the one place the translation happens: the SDK
+// type is already here, and nothing downstream has to know it exists.
+//
+// Errors the SDK does not wrap — dial failures, request timeouts, context
+// errors — are returned unchanged. They already carry the interfaces
+// (net.Error, context) that classification uses, and re-labelling them as API
+// errors would invent a status code that never came off the wire.
+func translateError(err error) error {
+	var apiErr *sdk.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	return &llm.APIError{
+		Provider:   providerName,
+		StatusCode: apiErr.StatusCode,
+		Err:        err,
+	}
 }
 
 // buildParams translates a provider-agnostic request into SDK params.

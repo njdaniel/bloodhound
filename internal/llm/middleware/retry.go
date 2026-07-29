@@ -7,8 +7,6 @@ import (
 	"net"
 	"time"
 
-	sdk "github.com/anthropics/anthropic-sdk-go"
-
 	"github.com/njdaniel/bloodhound/internal/llm"
 )
 
@@ -86,12 +84,20 @@ func (r *Retry) CountCost(u llm.Usage) llm.Cost { return r.next.CountCost(u) }
 func (r *Retry) Name() string { return r.next.Name() }
 
 // Transient reports whether err is a transient API failure worth retrying:
-// an Anthropic API error with status 429 or 5xx, or a timeout (any net.Error
-// with Timeout() true, which includes per-request HTTP timeouts and
+// an error that classifies itself as transient (llm.TransientError, which
+// llm.APIError implements for status 429 and 5xx), or a timeout (any
+// net.Error with Timeout() true, which includes per-request HTTP timeouts and
 // context.DeadlineExceeded). Other 4xx statuses and deliberate cancellation
-// are permanent. When the timeout came from the caller's own context, the
-// retry loop still stops immediately: its backoff sleep returns the context's
-// error before another attempt is made.
+// are permanent. The two checks are cumulative, not exclusive: an error that
+// says it is not transient is still retried if it wraps a timeout. When the
+// timeout came from the caller's own context, the retry loop still stops
+// immediately: its backoff sleep returns the context's error before another
+// attempt is made.
+//
+// The classification is provider-agnostic on purpose: it knows nothing about
+// any provider SDK. Each provider translates its client library's errors into
+// llm types at its own boundary (see internal/llm/anthropic), so a backend
+// whose errors this package has never seen still gets the same retry policy.
 func Transient(err error) bool {
 	if err == nil {
 		return false
@@ -99,9 +105,18 @@ func Transient(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return false
 	}
-	var apiErr *sdk.Error
-	if errors.As(err, &apiErr) {
-		return apiErr.StatusCode == 429 || apiErr.StatusCode >= 500
+	// errors.As walks the whole tree, including errors that wrap more than
+	// one cause; the nearest self-classifying error wins.
+	//
+	// A "no" here is not final: an error may classify itself as permanent
+	// while wrapping a timeout it has no status for (a provider reporting a
+	// dial timeout as an llm.APIError with no status code, say). Falling
+	// through to the timeout check cannot make a genuinely permanent failure
+	// retryable — a 404 does not implement net.Error — but it stops a
+	// status-less wrapper from swallowing a timeout.
+	var classified llm.TransientError
+	if errors.As(err, &classified) && classified.Transient() {
+		return true
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
