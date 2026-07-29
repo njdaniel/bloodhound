@@ -85,6 +85,8 @@ const (
 	seriesMetadataDescription = "Discover metrics and their label structure before writing PromQL. " +
 		"match is a series selector (e.g. '{namespace=\"shop\"}') or a bare metric name. " +
 		"Returns at most 25 metrics, alphabetical, each with type, help text, and up to 10 sample values per label key. " +
+		"Discovery covers only series with samples in the last 1h: a metric missing here may still exist " +
+		"with older data, so treat absence as \"no recent samples\", not \"no such metric\", and confirm with query_range over the window you care about. " +
 		"The truncation block records dropped metrics; narrow the match selector to see more."
 )
 

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -363,6 +366,71 @@ func TestSeriesMetadataMetricAndLabelValueCaps(t *testing.T) {
 	}
 	if pods := g.Metrics[0].Labels["pod"]; len(pods) != MaxLabelValues {
 		t.Errorf("metric_00 pod values = %d, want capped at %d", len(pods), MaxLabelValues)
+	}
+}
+
+// TestSeriesMetadataBoundsUpstreamRequests pins the wire request, not the
+// payload: an unbounded /api/v1/series makes Prometheus scan its full
+// retention and an unbounded /api/v1/metadata describes every metric on the
+// server, both to produce a result capped at 25 metrics (issue #11).
+func TestSeriesMetadataBoundsUpstreamRequests(t *testing.T) {
+	fake := newFakeProm(t)
+	ts := newTestToolServer(fake)
+
+	before := time.Now()
+	if _, _, err := ts.handleSeriesMetadata(context.Background(), nil, seriesMetadataInput{Match: `{namespace="shop"}`}); err != nil {
+		t.Fatalf("handleSeriesMetadata: %v", err)
+	}
+	after := time.Now()
+
+	series := fake.lastParams("/api/v1/series")
+	if got := series.Get("match[]"); got != `{namespace="shop"}` {
+		t.Errorf("series match[] = %q, want the selector unchanged", got)
+	}
+	start, end := parseUnixParam(t, series, "start"), parseUnixParam(t, series, "end")
+	if window := end.Sub(start); window != MetadataLookback {
+		t.Errorf("series window = %v, want MetadataLookback (%v)", window, MetadataLookback)
+	}
+	if end.Before(before.Add(-time.Second)) || end.After(after.Add(time.Second)) {
+		t.Errorf("series end = %v, want the window to end at call time (%v..%v)", end, before, after)
+	}
+	if got := series.Get("limit"); got != strconv.Itoa(MaxUpstreamSeries) {
+		t.Errorf("series limit = %q, want %d", got, MaxUpstreamSeries)
+	}
+	if got := fake.lastParams("/api/v1/metadata").Get("limit"); got != strconv.Itoa(MaxUpstreamMetadata) {
+		t.Errorf("metadata limit = %q, want %d", got, MaxUpstreamMetadata)
+	}
+}
+
+// parseUnixParam reads a Prometheus unix-seconds timestamp parameter.
+func parseUnixParam(t *testing.T, params url.Values, key string) time.Time {
+	t.Helper()
+	raw := params.Get(key)
+	secs, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		t.Fatalf("parsing %s=%q as unix seconds: %v", key, raw, err)
+	}
+	return time.UnixMilli(int64(secs * 1000))
+}
+
+// TestSeriesMetadataMarksUpstreamSeriesCap covers the case where the server
+// honours the limit: the caps the model is told about must include the one
+// applied upstream, or it reads a partial discovery as a complete one.
+func TestSeriesMetadataMarksUpstreamSeriesCap(t *testing.T) {
+	fake := newFakeProm(t)
+	sets := make([]map[string]string, 0, MaxUpstreamSeries)
+	for i := 0; i < MaxUpstreamSeries; i++ {
+		sets = append(sets, map[string]string{"__name__": "metric_00", "pod": fmt.Sprintf("pod-%04d", i)})
+	}
+	fake.set("/api/v1/series", 200, seriesJSON(t, sets))
+	ts := newTestToolServer(fake)
+
+	res, _, err := ts.handleSeriesMetadata(context.Background(), nil, seriesMetadataInput{Match: `{__name__=~".+"}`})
+	if err != nil {
+		t.Fatalf("handleSeriesMetadata: %v", err)
+	}
+	if note := decodeMetadata(t, res).Truncation.Note; !strings.Contains(note, "upstream series lookup") {
+		t.Errorf("truncation note %q does not report the upstream series cap", note)
 	}
 }
 
