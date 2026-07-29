@@ -56,6 +56,9 @@ One table, shared by all tools, defined in one place in code:
 | `MaxAlerts` | 50 | `list_alerts` |
 | `MaxMetadataMetrics` | 25 | `series_metadata` |
 | `MaxLabelValues` | 10 | per label key in `series_metadata` |
+| `MetadataLookback` | 1h | `series_metadata` discovery window: `start`/`end` on `/api/v1/series`, so Prometheus does not scan full retention |
+| `MaxUpstreamSeries` | 2000 | `limit` sent to `/api/v1/series` by `series_metadata` |
+| `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
 | `MaxAnnotationLen` | 200 | alert annotation values |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning (§2.3) |
@@ -135,6 +138,24 @@ Output per metric: name, type, help (truncated), label keys with up to
 `MaxLabelValues` sample values each. Backed by `/api/v1/metadata` +
 `/api/v1/series`. Cap `MaxMetadataMetrics` metrics, alphabetical (discovery
 tool — determinism beats relevance ranking here).
+
+**Upstream cost is bounded too, not just the output.** `/api/v1/series` is
+called with `start = now − MetadataLookback`, `end = now` and
+`limit = MaxUpstreamSeries`; `/api/v1/metadata` with
+`limit = MaxUpstreamMetadata`. Without the window Prometheus scans full
+retention, and without the metadata limit it describes every metric it knows —
+both to produce a result capped at 25 metrics. `limit` is advisory: Prometheus
+versions that predate it ignore the parameter, so the client-side caps stay
+authoritative and the output is bounded either way.
+
+Two consequences, both deliberate:
+
+- A metric with no samples in the last `MetadataLookback` is invisible to
+  discovery. The tool description says so explicitly, because a model that
+  reads absence as non-existence will stop investigating a real metric.
+- When the server honours the series limit, the result may be missing whole
+  metrics. That is a truncation like any other and is marked in
+  `truncation.note`.
 
 ### 2.3 Exact truncation strategy (`query_range`)
 

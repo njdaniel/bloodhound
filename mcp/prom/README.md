@@ -51,6 +51,9 @@ One table, defined once in `guardrails.go`, shared by all tools:
 | `MaxAlerts` | 50 | `list_alerts` |
 | `MaxMetadataMetrics` | 25 | `series_metadata` |
 | `MaxLabelValues` | 10 | per label key in `series_metadata` |
+| `MetadataLookback` | 1h | `series_metadata` discovery window (`start`/`end` on `/api/v1/series`) |
+| `MaxUpstreamSeries` | 2000 | `limit` sent to `/api/v1/series` by `series_metadata` |
+| `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
 | `MaxAnnotationLen` | 200 | alert annotation values |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning |
@@ -186,6 +189,14 @@ Output: `{ "metrics": [{ "name", "type", "help", "labels": { "<key>":
 (what matches) plus `/api/v1/metadata` (type/help). At most 25 metrics,
 alphabetical (discovery tool — determinism beats relevance ranking), with up
 to 10 sample values per label key.
+
+Both upstream calls are bounded as well as the output: the series lookup is
+restricted to the last `MetadataLookback` and to `MaxUpstreamSeries` series,
+and the metadata lookup to `MaxUpstreamMetadata` metrics. So discovery only
+sees series with recent samples — a metric absent from the result may still
+exist with older data, which the tool description tells the model. `limit` is
+ignored by Prometheus versions that predate it; the client-side caps are what
+guarantee a bounded result.
 
 ## Tests
 

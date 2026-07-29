@@ -80,7 +80,7 @@ payload:
 | `query_range` | Up to 15 series over a ≤24h window, ≤120 points each, with min/max/avg/last computed at full resolution. |
 | `query_instant` | Up to 100 samples at one instant, outliers first. |
 | `list_alerts` | Up to 50 active alerts, newest first. |
-| `series_metadata` | Up to 25 metrics with type, help, and sample label values — metric discovery before writing PromQL. |
+| `series_metadata` | Up to 25 metrics with type, help, and sample label values, from the last 1h of series — metric discovery before writing PromQL. |
 
 **Not yet:** logs, Kubernetes, and runbook hounds (M2), the adversarial
 verifier and Slack output (M3), the eval harness and any numbers (M4).
