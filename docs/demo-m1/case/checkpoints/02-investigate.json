@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "case_id": "c-20260729T000956-5afef8",
+  "phase": "investigate",
+  "status": "completed",
+  "started_at": "2026-07-29T00:09:56.975002238Z",
+  "finished_at": "2026-07-29T00:09:56.98173498Z",
+  "spend": {
+    "input_tokens": 7100,
+    "output_tokens": 620,
+    "usd": 0,
+    "tool_calls": 2,
+    "wall_ms": 6
+  },
+  "output": {
+    "hound": "metrics",
+    "summary": "checkout-7d9f is in CrashLoopBackOff and its restart counter is still climbing across the alert window; the container never reaches a ready state, which is the signature of a container that fails immediately on start rather than one degrading under load.",
+    "confidence": 0.78,
+    "onset": "2026-07-29T00:07:56Z",
+    "evidence": [
+      {
+        "tool": "query_range",
+        "query": "kube_pod_container_status_restarts_total{namespace=\"shop\",pod=\"checkout-7d9f\"}",
+        "observation": "the restart counter rises monotonically across the window and has not plateaued",
+        "capture_ref": "mcp/001-query_range.json"
+      }
+    ],
+    "dead_ends": [
+      {
+        "theory": "a traffic spike overloaded checkout",
+        "ruled_out_by": "no request-rate series exists in this namespace's metric surface, so the theory cannot be supported from metrics alone"
+      }
+    ]
+  },
+  "error": null
+}

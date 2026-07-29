@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "case_id": "c-20260729T000956-5afef8",
+  "phase": "report",
+  "status": "completed",
+  "started_at": "2026-07-29T00:09:56.993349213Z",
+  "finished_at": "2026-07-29T00:09:57.010780771Z",
+  "spend": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "usd": 0,
+    "tool_calls": 0,
+    "wall_ms": 17
+  },
+  "output": {
+    "artifacts": [
+      "report.json",
+      "report.txt"
+    ]
+  },
+  "error": null
+}

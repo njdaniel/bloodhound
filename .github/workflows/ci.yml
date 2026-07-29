@@ -21,3 +21,17 @@ jobs:
         run: go build ./...
       - name: test
         run: go test ./...
+
+  # Real-Prometheus integration tests. A separate job from `build` because it
+  # pulls a container image and takes minutes rather than seconds. It is NOT
+  # label-gated: no secrets and no paid API calls are involved — unlike the
+  # eval runs that arrive in M4 (CLAUDE.md).
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: integration tests
+        run: make test-integration

@@ -1,0 +1,13 @@
+{
+  "seq": 1,
+  "tool": "query_range",
+  "args": {
+    "query": "kube_pod_container_status_restarts_total{namespace=\"shop\",pod=\"checkout-7d9f\"}",
+    "start": "2026-07-29T00:07:56Z",
+    "end": "2026-07-29T00:09:56Z"
+  },
+  "result": {
+    "text": "{\"resolved_step_seconds\":1,\"series\":[{\"labels\":{\"__name__\":\"kube_pod_container_status_restarts_total\",\"container\":\"checkout\",\"instance\":\"127.0.0.1:35647\",\"job\":\"kube-state-metrics\",\"namespace\":\"shop\",\"pod\":\"checkout-7d9f\"},\"stats\":{\"min\":1,\"max\":37,\"avg\":19,\"last\":37},\"points\":[[1785283787,\"1\"],[1785283788,\"5\"],[1785283789,\"9\"],[1785283790,\"13\"],[1785283791,\"17\"],[1785283792,\"21\"],[1785283793,\"25\"],[1785283794,\"29\"],[1785283795,\"33\"],[1785283796,\"37\"]]}],\"truncation\":{\"series_total\":1,\"series_returned\":1,\"points_thinned\":false}}",
+    "capture_ref": "mcp/001-query_range.json"
+  }
+}
