@@ -33,6 +33,29 @@ const (
 	// MaxLabelValues caps sample values per label key in series_metadata.
 	MaxLabelValues = 10
 
+	// MetadataLookback is the discovery window series_metadata sends as
+	// start/end on /api/v1/series. Without it Prometheus scans the whole
+	// retention period to answer a question whose result is then reduced to
+	// MaxMetadataMetrics anyway. The cost of the window is that a metric with
+	// no samples in the last hour is invisible to discovery, which the tool
+	// description states so the model does not read absence as non-existence.
+	MetadataLookback = time.Hour
+
+	// MaxUpstreamSeries is the limit series_metadata sends to
+	// /api/v1/series. Recent Prometheus versions honour it; older ones ignore
+	// unknown parameters, so the client-side caps stay authoritative and the
+	// output is bounded either way. It is far above MaxMetadataMetrics on
+	// purpose: one metric contributes many series, and label values are
+	// derived from them.
+	MaxUpstreamSeries = 2000
+
+	// MaxUpstreamMetadata is the limit series_metadata sends to
+	// /api/v1/metadata, which otherwise returns help and type text for every
+	// metric on the server. Prometheus truncates in unspecified order, so the
+	// value is generous: a metric dropped upstream still appears in the
+	// result, just without its type and help.
+	MaxUpstreamMetadata = 2000
+
 	// MaxStringLen caps any label value / metadata string, in bytes.
 	// Longer strings are truncated to 117 bytes plus "…" (3 bytes).
 	MaxStringLen = 120

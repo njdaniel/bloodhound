@@ -460,10 +460,38 @@ type metadataResult struct {
 // /api/v1/metadata (type and help text). At most MaxMetadataMetrics metrics,
 // alphabetical — this is a discovery tool, so determinism beats relevance
 // ranking — with at most MaxLabelValues sample values per label key.
+//
+// Both upstream calls are bounded as well as the output: the series lookup
+// covers only the last MetadataLookback and asks for at most
+// MaxUpstreamSeries series, and the metadata lookup asks for at most
+// MaxUpstreamMetadata metrics. Otherwise a discovery call that returns 25
+// metrics makes Prometheus scan its full retention and describe every metric
+// it knows.
 func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRequest, in seriesMetadataInput) (*mcp.CallToolResult, any, error) {
-	sets, err := s.prom.series(ctx, in.Match)
+	end := time.Now()
+	start := end.Add(-MetadataLookback)
+	sets, warnings, err := s.prom.series(ctx, in.Match, start, end, MaxUpstreamSeries)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Whether the server truncated is answered by the warnings, not by the
+	// result count: a server old enough to ignore limit returns everything,
+	// and counting would then claim a drop that never happened.
+	//
+	// Only a truncation warning may produce the truncation sentence. Other
+	// warnings are real but different problems — "store(s) unavailable;
+	// partial response" from a Thanos/Cortex backend or a failing remote_read
+	// — and blaming those on the series limit hands the model a fabricated
+	// cause and useless advice. They are passed through verbatim instead,
+	// which is something it can actually act on.
+	var seriesCapped bool
+	var otherWarnings []string
+	for _, w := range warnings {
+		if strings.Contains(strings.ToLower(w), "truncated") {
+			seriesCapped = true
+			continue
+		}
+		otherWarnings = append(otherWarnings, w)
 	}
 
 	byMetric := map[string]map[string]map[string]bool{} // metric → label key → value set
@@ -494,18 +522,21 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 		names = names[:MaxMetadataMetrics]
 	}
 
-	meta, err := s.prom.metadata(ctx)
+	meta, err := s.prom.metadata(ctx, MaxUpstreamMetadata)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	valuesCapped := false
+	metaIncomplete := false
 	metrics := make([]metricMeta, 0, len(names))
 	for _, name := range names {
 		m := metricMeta{Name: name, Labels: map[string][]string{}}
 		if entries := meta[name]; len(entries) > 0 {
 			m.Type = entries[0].Type
 			m.Help = truncateString(entries[0].Help, MaxStringLen)
+		}
+		if m.Type == "" || m.Help == "" {
+			metaIncomplete = true
 		}
 		for key, valueSet := range byMetric[name] {
 			values := make([]string, 0, len(valueSet))
@@ -525,19 +556,46 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 		metrics = append(metrics, m)
 	}
 
-	var dropNote, capNote string
-	if total > MaxMetadataMetrics {
-		dropNote = fmt.Sprintf("%d metrics dropped; sorted alphabetically. Narrow the match selector.", total-MaxMetadataMetrics)
+	// /api/v1/metadata does not warn when it truncates, and it fills its map
+	// by walking active targets until the limit, so which metrics survive is
+	// arbitrary and can differ between two calls. A full map is therefore
+	// read as "possibly truncated" — but only worth saying when something in
+	// the result actually lacks type or help, since that is the only reading
+	// the cap can have corrupted (it used to mean "not registered", full
+	// stop). Gating on it also removes the false positive on a server holding
+	// exactly MaxUpstreamMetadata metrics.
+	metadataCapped := len(meta) >= MaxUpstreamMetadata && metaIncomplete
+
+	// Every cap that was applied gets its own sentence; the advice they share
+	// is appended once, so a doubly-capped result does not repeat it.
+	var notes []string
+	metricsDropped := total > MaxMetadataMetrics
+	if metricsDropped {
+		notes = append(notes, fmt.Sprintf("%d metrics dropped; sorted alphabetically.", total-MaxMetadataMetrics))
 	}
 	if valuesCapped {
-		capNote = fmt.Sprintf("Some label keys show only the first %d values (sorted).", MaxLabelValues)
+		notes = append(notes, fmt.Sprintf("Some label keys show only the first %d values (sorted).", MaxLabelValues))
+	}
+	if seriesCapped {
+		notes = append(notes, fmt.Sprintf("Prometheus truncated the series lookup at its %d-series limit, so some metrics may be missing entirely.", MaxUpstreamSeries))
+	}
+	if metadataCapped {
+		notes = append(notes, fmt.Sprintf("The metadata lookup hit its %d-metric limit, so an empty type or help may mean the metadata was not fetched rather than not registered.", MaxUpstreamMetadata))
+	}
+	if metricsDropped || seriesCapped {
+		notes = append(notes, "Narrow the match selector.")
+	}
+	if len(otherWarnings) > 0 {
+		// Verbatim, so the model sees the backend's own words, but bounded
+		// like every other string this server emits.
+		notes = append(notes, "Prometheus warned: "+truncateString(strings.Join(otherWarnings, "; "), MaxStringLen)+".")
 	}
 	payload, err := json.Marshal(metadataResult{
 		Metrics: metrics,
 		Truncation: metadataTruncation{
 			MetricsTotal:    total,
 			MetricsReturned: len(metrics),
-			Note:            joinNotes(dropNote, capNote),
+			Note:            joinNotes(notes...),
 		},
 	})
 	if err != nil {

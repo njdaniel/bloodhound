@@ -31,19 +31,32 @@ func newPromClient(baseURL string, timeout time.Duration) *promClient {
 	}
 }
 
-// apiEnvelope is the standard Prometheus API response wrapper.
+// apiEnvelope is the standard Prometheus API response wrapper. Warnings
+// carries the non-fatal notices Prometheus attaches to an otherwise
+// successful response — "results truncated due to limit" among them, which is
+// the only signal that a server-side cap took effect.
 type apiEnvelope struct {
 	Status    string          `json:"status"`
 	Data      json.RawMessage `json:"data"`
+	Warnings  []string        `json:"warnings"`
 	ErrorType string          `json:"errorType"`
 	Error     string          `json:"error"`
 }
 
-// get performs a GET against path (e.g. "/api/v1/query_range") with params,
-// enforcing the client timeout, and returns the "data" payload. Prometheus
-// API errors (bad PromQL, invalid parameters) are returned as errors carrying
-// the upstream message so the model can correct its input.
+// get performs a GET against path (e.g. "/api/v1/query_range") with params
+// and returns the "data" payload, discarding any warnings. Callers that act
+// on warnings use getWithWarnings.
 func (c *promClient) get(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
+	data, _, err := c.getWithWarnings(ctx, path, params)
+	return data, err
+}
+
+// getWithWarnings performs a GET against path with params, enforcing the
+// client timeout, and returns the "data" payload plus the response's
+// warnings. Prometheus API errors (bad PromQL, invalid parameters) are
+// returned as errors carrying the upstream message so the model can correct
+// its input.
+func (c *promClient) getWithWarnings(ctx context.Context, path string, params url.Values) (json.RawMessage, []string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
@@ -53,26 +66,26 @@ func (c *promClient) get(ctx context.Context, path string, params url.Values) (j
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("building request for %s: %w", path, err)
+		return nil, nil, fmt.Errorf("building request for %s: %w", path, err)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("calling prometheus %s: %w", path, err)
+		return nil, nil, fmt.Errorf("calling prometheus %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, fmt.Errorf("reading prometheus %s response: %w", path, err)
+		return nil, nil, fmt.Errorf("reading prometheus %s response: %w", path, err)
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, fmt.Errorf("decoding prometheus %s response (HTTP %d): %w", path, resp.StatusCode, err)
+		return nil, nil, fmt.Errorf("decoding prometheus %s response (HTTP %d): %w", path, resp.StatusCode, err)
 	}
 	if env.Status != "success" {
-		return nil, fmt.Errorf("prometheus rejected the request (%s): %s — fix the query and retry", env.ErrorType, env.Error)
+		return nil, nil, fmt.Errorf("prometheus rejected the request (%s): %s — fix the query and retry", env.ErrorType, env.Error)
 	}
-	return env.Data, nil
+	return env.Data, env.Warnings, nil
 }
 
 // promPoint is one Prometheus sample: a float timestamp (unix seconds) and a
@@ -210,9 +223,11 @@ type promMetadata struct {
 }
 
 // metadata calls /api/v1/metadata and returns metadata entries keyed by
-// metric name.
-func (c *promClient) metadata(ctx context.Context) (map[string][]promMetadata, error) {
-	data, err := c.get(ctx, "/api/v1/metadata", nil)
+// metric name. limit caps the number of metrics the server is asked for;
+// Prometheus versions that predate the parameter ignore it, so callers must
+// still cap what they use.
+func (c *promClient) metadata(ctx context.Context, limit int) (map[string][]promMetadata, error) {
+	data, err := c.get(ctx, "/api/v1/metadata", url.Values{"limit": {strconv.Itoa(limit)}})
 	if err != nil {
 		return nil, err
 	}
@@ -223,18 +238,28 @@ func (c *promClient) metadata(ctx context.Context) (map[string][]promMetadata, e
 	return d, nil
 }
 
-// series calls /api/v1/series with the given series selector and returns the
-// matching labelsets.
-func (c *promClient) series(ctx context.Context, match string) ([]map[string]string, error) {
-	data, err := c.get(ctx, "/api/v1/series", url.Values{"match[]": {match}})
+// series calls /api/v1/series with the given series selector, restricted to
+// the [start, end] window, and returns the matching labelsets together with
+// the response's warnings. Without a window Prometheus scans the full
+// retention period. limit caps the number of series the server is asked for;
+// versions that predate the parameter ignore it, so callers must still cap
+// what they use — and must read the warnings rather than the result count to
+// learn whether the server actually truncated.
+func (c *promClient) series(ctx context.Context, match string, start, end time.Time, limit int) ([]map[string]string, []string, error) {
+	data, warnings, err := c.getWithWarnings(ctx, "/api/v1/series", url.Values{
+		"match[]": {match},
+		"start":   {formatTime(start)},
+		"end":     {formatTime(end)},
+		"limit":   {strconv.Itoa(limit)},
+	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var sets []map[string]string
 	if err := json.Unmarshal(data, &sets); err != nil {
-		return nil, fmt.Errorf("decoding series data: %w", err)
+		return nil, nil, fmt.Errorf("decoding series data: %w", err)
 	}
-	return sets, nil
+	return sets, warnings, nil
 }
 
 // formatTime renders t as unix seconds (fractional if needed) for Prometheus

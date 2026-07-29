@@ -81,12 +81,18 @@ const (
 		"Alerts are sorted by active_at descending (newest first) and capped at 50; " +
 		"annotation values are truncated to 200 characters. " +
 		"The truncation block records any dropped alerts."
-
-	seriesMetadataDescription = "Discover metrics and their label structure before writing PromQL. " +
-		"match is a series selector (e.g. '{namespace=\"shop\"}') or a bare metric name. " +
-		"Returns at most 25 metrics, alphabetical, each with type, help text, and up to 10 sample values per label key. " +
-		"The truncation block records dropped metrics; narrow the match selector to see more."
 )
+
+// seriesMetadataDescription is built rather than declared: it quotes
+// MetadataLookback, and a hardcoded window would silently lie to the model
+// the day that constant changes.
+var seriesMetadataDescription = "Discover metrics and their label structure before writing PromQL. " +
+	"match is a series selector (e.g. '{namespace=\"shop\"}') or a bare metric name. " +
+	"Returns at most 25 metrics, alphabetical, each with type, help text, and up to 10 sample values per label key. " +
+	"Discovery covers only series with samples in the last " + shortDuration(MetadataLookback) + ": a metric missing here may still exist " +
+	"with older data, so treat absence as \"no recent samples\", not \"no such metric\" — " +
+	"confirm with query_instant at an explicit past time, or query_range over a window within its 24h limit. " +
+	"The truncation block records dropped metrics; narrow the match selector to see more."
 
 // newServer builds the mcp-prom MCP server with the four tools registered.
 func newServer(prom *promClient) *mcp.Server {
