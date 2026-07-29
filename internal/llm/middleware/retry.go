@@ -88,9 +88,11 @@ func (r *Retry) Name() string { return r.next.Name() }
 // llm.APIError implements for status 429 and 5xx), or a timeout (any
 // net.Error with Timeout() true, which includes per-request HTTP timeouts and
 // context.DeadlineExceeded). Other 4xx statuses and deliberate cancellation
-// are permanent. When the timeout came from the caller's own context, the
-// retry loop still stops immediately: its backoff sleep returns the context's
-// error before another attempt is made.
+// are permanent. The two checks are cumulative, not exclusive: an error that
+// says it is not transient is still retried if it wraps a timeout. When the
+// timeout came from the caller's own context, the retry loop still stops
+// immediately: its backoff sleep returns the context's error before another
+// attempt is made.
 //
 // The classification is provider-agnostic on purpose: it knows nothing about
 // any provider SDK. Each provider translates its client library's errors into
@@ -105,9 +107,16 @@ func Transient(err error) bool {
 	}
 	// errors.As walks the whole tree, including errors that wrap more than
 	// one cause; the nearest self-classifying error wins.
+	//
+	// A "no" here is not final: an error may classify itself as permanent
+	// while wrapping a timeout it has no status for (a provider reporting a
+	// dial timeout as an llm.APIError with no status code, say). Falling
+	// through to the timeout check cannot make a genuinely permanent failure
+	// retryable — a 404 does not implement net.Error — but it stops a
+	// status-less wrapper from swallowing a timeout.
 	var classified llm.TransientError
-	if errors.As(err, &classified) {
-		return classified.Transient()
+	if errors.As(err, &classified) && classified.Transient() {
+		return true
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {

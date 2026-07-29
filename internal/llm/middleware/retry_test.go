@@ -74,6 +74,18 @@ func TestTransientClassification(t *testing.T) {
 		{"wrapped 400", fmt.Errorf("calling api: %w", apiErr(400)), false},
 		{"self-classified transient", selfClassifyingErr{transient: true}, true},
 		{"self-classified permanent", selfClassifyingErr{transient: false}, false},
+		// A self-classifying error that says "not transient" must not shadow
+		// a timeout it wraps: the status-less APIError a provider builds
+		// around a dial timeout is exactly the silent non-retry this
+		// classification was made provider-agnostic to prevent.
+		{"no status wrapping a timeout",
+			&llm.APIError{Provider: "ollama", Err: timeoutErr{}}, true},
+		{"no status wrapping a context deadline",
+			&llm.APIError{Provider: "ollama", Err: context.DeadlineExceeded}, true},
+		{"no status wrapping a non-timeout error",
+			&llm.APIError{Provider: "ollama", Err: errors.New("malformed response")}, false},
+		{"permanent status wrapping a non-timeout error",
+			&llm.APIError{Provider: "ollama", StatusCode: 404, Err: errors.New("no such model")}, false},
 		// An error wrapping two causes makes errors.As walk a tree, not a
 		// chain; the API error hiding in the second branch still counts.
 		{"429 in the second of two wrapped causes",

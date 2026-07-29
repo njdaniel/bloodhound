@@ -24,7 +24,12 @@ type APIError struct {
 	// Provider.Name() (e.g. "anthropic", "ollama").
 	Provider string
 	// StatusCode is the HTTP status the backend returned. Zero means the
-	// failure carried no status.
+	// failure carried no status, which Transient reports as permanent: with
+	// no status there is nothing to classify on. A provider wrapping a
+	// status-less failure it knows is retryable — a dial timeout, say —
+	// should either leave that error alone (retry policy classifies timeouts
+	// itself) or implement TransientError with its own judgement rather than
+	// relying on a zero status here.
 	StatusCode int
 	// Message is the backend's error text. Optional: when empty, Error falls
 	// back to the wrapped error's message.
@@ -57,7 +62,12 @@ func (e *APIError) Unwrap() error { return e.Err }
 // Transient reports whether the request is worth retrying: rate limits (429)
 // and server-side failures (5xx) are, since the same request may succeed
 // later. Every other status — the rest of the 4xx family above all — is a
-// problem with the request itself and will fail identically on a retry.
+// problem with the request itself and will fail identically on a retry, and
+// so is a zero status, which says nothing to classify on.
+//
+// A false answer is not the last word: retry policy also asks whether the
+// error wraps a network timeout (see middleware.Transient), so an APIError
+// carrying no status but wrapping a timeout is still retried.
 func (e *APIError) Transient() bool {
 	return e.StatusCode == 429 || e.StatusCode >= 500
 }
