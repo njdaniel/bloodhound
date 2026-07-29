@@ -277,6 +277,40 @@ func TestQueryRangeSizeBackstop(t *testing.T) {
 	}
 }
 
+// TestQueryRangeCollidingLabelsetsRankDeterministically feeds two series that
+// tie on every ranking key and whose label sets render identically under naive
+// concatenation ({a: "b,c=d"} vs {a: "b", c: "d"}). If the labelset tie-break
+// cannot tell them apart, the sort keeps whatever order Prometheus returned,
+// so the same result set serialized in two upstream orders yields two
+// different payloads.
+func TestQueryRangeCollidingLabelsetsRankDeterministically(t *testing.T) {
+	// Identical value range (5) and max |value| (5): the labelset key is the
+	// only thing left to order them by.
+	merged := seriesFixture(map[string]string{"a": "b,c=d"},
+		[][2]any{{1753700000, "0"}, {1753700030, "5"}})
+	split := seriesFixture(map[string]string{"a": "b", "c": "d"},
+		[][2]any{{1753700000, "0"}, {1753700030, "5"}})
+
+	run := func(t *testing.T, upstream []map[string]any) string {
+		t.Helper()
+		fake := newFakeProm(t)
+		fake.set("/api/v1/query_range", 200, matrixJSON(t, upstream))
+		res, _, err := newTestToolServer(fake).handleQueryRange(context.Background(), nil, queryRangeInput{
+			Query: "up", Start: "2026-07-28T10:00:00Z", End: "2026-07-28T10:01:00Z",
+		})
+		if err != nil {
+			t.Fatalf("handleQueryRange: %v", err)
+		}
+		return resultText(t, res)
+	}
+
+	first := run(t, []map[string]any{merged, split})
+	second := run(t, []map[string]any{split, merged})
+	if first != second {
+		t.Errorf("upstream order changed the payload; the labelset tie-break is not total:\n a,b: %s\n b,a: %s", first, second)
+	}
+}
+
 func TestQueryRangeRangeLimitError(t *testing.T) {
 	ts := newTestToolServer(newFakeProm(t))
 	_, _, err := ts.handleQueryRange(context.Background(), nil, queryRangeInput{

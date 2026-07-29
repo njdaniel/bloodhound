@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -87,7 +88,16 @@ func computeStats(values []promPoint) (stats seriesStats, valueRange, maxAbs flo
 }
 
 // labelsetKey renders labels in canonical sorted-key order; it is the final,
-// fully deterministic tie-break for every ranking in this server.
+// fully deterministic tie-break for every ranking in this server. It is never
+// serialized — only compared.
+//
+// Names and values are quoted rather than concatenated raw, because raw
+// concatenation is not injective: {a: "b,c=d"} and {a: "b", c: "d"} both
+// render as `a=b,c=d`. Two distinct series sharing a key make the tie-break a
+// no-op, and the ranking then falls back to whatever order Prometheus
+// happened to return — which is exactly the nondeterminism this key exists to
+// remove. Quoting escapes the separators (and any embedded quote), so the
+// rendering is reversible: distinct label sets always produce distinct keys.
 func labelsetKey(labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
@@ -99,9 +109,9 @@ func labelsetKey(labels map[string]string) string {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		b.WriteString(k)
+		b.WriteString(strconv.Quote(k))
 		b.WriteByte('=')
-		b.WriteString(labels[k])
+		b.WriteString(strconv.Quote(labels[k]))
 	}
 	return b.String()
 }
@@ -116,7 +126,10 @@ type rankedSeries struct {
 
 // rankSeries sorts series per spec 002 §2.3 step 4: (max−min) descending,
 // then max |value| descending, then lexicographically by sorted labelset.
-// Labelsets are unique within a Prometheus result, so the order is total.
+// Labelsets are unique within a Prometheus result and labelsetKey maps
+// distinct labelsets to distinct keys, so the comparison is a total order:
+// an unstable sort has exactly one answer to arrive at, whatever order the
+// input arrived in.
 func rankSeries(rs []rankedSeries) {
 	sort.Slice(rs, func(i, j int) bool {
 		if rs[i].valueRange != rs[j].valueRange {
