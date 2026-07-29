@@ -168,7 +168,7 @@ func Start(ctx context.Context, cfg Config) (_ *Server, err error) {
 		logs, _ := srv.Logs(ctx)
 		stopErr := srv.Stop()
 		if stopErr != nil {
-			return nil, fmt.Errorf("%w (and stopping the container failed: %v); container logs:\n%s", err, stopErr, logs)
+			return nil, fmt.Errorf("%w (and stopping the container failed: %w); container logs:\n%s", err, stopErr, logs)
 		}
 		return nil, fmt.Errorf("%w; container logs:\n%s", err, logs)
 	}
@@ -284,7 +284,7 @@ func (s *Server) WaitForSamples(ctx context.Context, expr string, wantSamples in
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for samples of %q: %w (last: %v)", expr, ctx.Err(), lastErr)
+			return fmt.Errorf("waiting for samples of %q: %w (last: %w)", expr, ctx.Err(), lastErr)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

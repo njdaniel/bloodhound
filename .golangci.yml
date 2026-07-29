@@ -1,0 +1,83 @@
+version: "2"
+
+run:
+  # Lint the integration-tagged files too. `make test-integration` is a CI job,
+  # so the code behind that tag is shipped code — leaving it unlinted would
+  # exempt exactly the package that drives containers and raw sockets.
+  build-tags:
+    - integration
+
+# Linters are chosen to enforce the house rules in CLAUDE.md mechanically,
+# rather than to maximize the number of checks running. Anything that fires
+# mostly on style preference is left off: a noisy lint job trains people to
+# ignore it.
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    # "Errors: wrap with fmt.Errorf(\"doing x: %w\", err)" — errorlint catches
+    # the other half of that rule: formatting or comparing errors in ways that
+    # silently break under wrapping.
+    - errorlint
+    # "no panics outside main."
+    - forbidigo
+    # Every response body from the Prometheus HTTP API must be closed.
+    - bodyclose
+    # A context.Context is threaded through every LLM and MCP call
+    # (CLAUDE.md); these catch the ways that thread gets dropped.
+    - contextcheck
+    - noctx
+    - unconvert
+    - misspell
+
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^panic$
+          msg: no panics outside main (CLAUDE.md); return a wrapped error
+    staticcheck:
+      checks:
+        - all
+        # Initialisms; conflicts with names taken verbatim from the specs.
+        - -ST1003
+        # "Could remove embedded field from selector." Where a struct embeds a
+        # type *and* has a field of that type (intake's webhookPayload), the
+        # explicit selector is what makes the two readable side by side.
+        - -QF1008
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Tests panic freely and assert on concrete errors; the rules above are
+      # about production code paths.
+      - path: _test\.go
+        linters:
+          - forbidigo
+          - errcheck
+          - bodyclose
+          - noctx
+      # main is where panics and os.Exit legitimately live.
+      - path: ^cmd/
+        linters:
+          - forbidigo
+      # promtest is test scaffolding that drives the docker CLI and reserves a
+      # loopback port. Its teardown path deliberately ignores errors and
+      # deliberately does not thread the (already-failed) context into
+      # container cleanup — stopping the container has to happen either way.
+      - path: ^internal/promtest/
+        linters:
+          - contextcheck
+          - errcheck
+          - noctx
+
+# Report everything. The defaults cap output at 3 issues of a kind and 50 per
+# linter, which hides the tail of a problem and makes a partly-fixed run look
+# clean while more of the same remain.
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt

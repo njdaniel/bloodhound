@@ -446,7 +446,7 @@ func annotateDeadline(pctx context.Context, phase Phase, timeout time.Duration, 
 	if errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	return fmt.Errorf("%s timed out after %s: %w: %v", phase, timeout, context.DeadlineExceeded, err)
+	return fmt.Errorf("%s timed out after %s: %w: %w", phase, timeout, context.DeadlineExceeded, err)
 }
 
 // phaseIntake parses the alert file into the case and returns the Case as the

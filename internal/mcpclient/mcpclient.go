@@ -132,7 +132,11 @@ func Connect(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("scanning capture dir: %w", err)
 	}
 
-	cmd := exec.Command(cfg.Command, cfg.Args...)
+	// Not CommandContext: that kills the child with SIGKILL the instant ctx
+	// ends, which would tear down the stdio transport mid-frame and leave the
+	// server no chance to flush. The goroutine below ties the child to ctx
+	// through Close instead, which shuts the session down in order.
+	cmd := exec.Command(cfg.Command, cfg.Args...) //nolint:noctx // lifetime is tied to ctx via Close below
 	cmd.Env = append(os.Environ(), cfg.Env...)
 	cmd.Stderr = os.Stderr // surface server diagnostics alongside our own
 
@@ -218,7 +222,7 @@ func (s *Session) CallTool(ctx context.Context, tool string, args json.RawMessag
 
 	if werr := s.writeCapture(rec); werr != nil {
 		if err != nil {
-			return Result{}, fmt.Errorf("calling tool %q: %w (also failed to capture: %v)", tool, err, werr)
+			return Result{}, fmt.Errorf("calling tool %q: %w (also failed to capture: %w)", tool, err, werr)
 		}
 		return Result{}, werr
 	}

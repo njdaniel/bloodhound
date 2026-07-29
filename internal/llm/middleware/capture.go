@@ -82,7 +82,7 @@ func (c *Capture) Complete(ctx context.Context, req llm.Request) (llm.Response, 
 
 	if werr := c.write(rec); werr != nil {
 		if err != nil {
-			return llm.Response{}, fmt.Errorf("%w (also failed to capture: %v)", err, werr)
+			return llm.Response{}, fmt.Errorf("%w (also failed to capture: %w)", err, werr)
 		}
 		return llm.Response{}, werr
 	}
