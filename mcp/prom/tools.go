@@ -204,14 +204,18 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			}
 		}
 		if !changed {
-			// Every series is down to its first and last point and the
-			// payload still does not fit, so it ships oversized. Say so:
-			// an unmarked overflow is the one thing §2.1 rules out, because
-			// the model would read a capped result as a complete one. The
-			// note itself adds bytes to an already-oversized payload, which
-			// is the cheaper of the two costs.
-			notes = append(notes, fmt.Sprintf("Result exceeds the %d KiB response cap and cannot be thinned further (at most %d points per series remain); it is returned oversized. Narrow the selector or the window.",
-				MaxResponseBytes/1024, maxPts))
+			// Thinning has reached a fixed point and the payload still does
+			// not fit, so it ships oversized. Say so: an unmarked overflow
+			// is the one thing §2.1 rules out, because the model would read
+			// a capped result as a complete one. The note itself adds bytes
+			// to an already-oversized payload, which is the cheaper cost.
+			//
+			// "Fixed point" is not the same as "two points left". thinPoints
+			// keeps index 1 of every series, so a 3-point series thins to
+			// itself and the loop stops there — the note says what the rule
+			// can no longer do, not that the floor was reached.
+			notes = append(notes, fmt.Sprintf("Result exceeds the %s response cap and no further thinning is possible under the keep-first-and-last rule (at most %d points per series remain); it is returned oversized. Narrow the selector or the window.",
+				byteSize(MaxResponseBytes), maxPts))
 			res.Truncation.Note = joinNotes(notes...)
 			payload, err = json.Marshal(res)
 			if err != nil {
@@ -221,7 +225,7 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 		}
 		res.Truncation.PointsThinned = true
 		notes = append(notes[:preSizeNotes],
-			fmt.Sprintf("Points thinned to at most %d per series to fit the %d KiB response cap; first and last points kept; stats reflect full resolution.", maxPts, MaxResponseBytes/1024))
+			fmt.Sprintf("Points thinned to at most %d per series to fit the %s response cap; first and last points kept; stats reflect full resolution.", maxPts, byteSize(MaxResponseBytes)))
 		res.Truncation.Note = joinNotes(notes...)
 		payload, err = json.Marshal(res)
 		if err != nil {

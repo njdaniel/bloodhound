@@ -617,6 +617,27 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
+// TestByteSize pins that a cap quoted to the model is the cap that applies.
+// Integer division alone floors, so a non-multiple of 1024 would be described
+// as a smaller limit than the one actually enforced.
+func TestByteSize(t *testing.T) {
+	tests := []struct {
+		in   int
+		want string
+	}{
+		{MaxResponseBytes, "32 KiB"},
+		{1024, "1 KiB"},
+		{40000, "40000 bytes"},
+		{1023, "1023 bytes"},
+		{0, "0 KiB"},
+	}
+	for _, tc := range tests {
+		if got := byteSize(tc.in); got != tc.want {
+			t.Errorf("byteSize(%d) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestLabelsetKeyIsUnambiguous pins the one property the final ranking
 // tie-break depends on: distinct label sets must never share a key. Raw
 // concatenation collides whenever a value contains the separators, which
