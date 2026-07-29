@@ -460,11 +460,24 @@ type metadataResult struct {
 // /api/v1/metadata (type and help text). At most MaxMetadataMetrics metrics,
 // alphabetical — this is a discovery tool, so determinism beats relevance
 // ranking — with at most MaxLabelValues sample values per label key.
+//
+// Both upstream calls are bounded as well as the output: the series lookup
+// covers only the last MetadataLookback and asks for at most
+// MaxUpstreamSeries series, and the metadata lookup asks for at most
+// MaxUpstreamMetadata metrics. Otherwise a discovery call that returns 25
+// metrics makes Prometheus scan its full retention and describe every metric
+// it knows.
 func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRequest, in seriesMetadataInput) (*mcp.CallToolResult, any, error) {
-	sets, err := s.prom.series(ctx, in.Match)
+	end := time.Now()
+	start := end.Add(-MetadataLookback)
+	sets, err := s.prom.series(ctx, in.Match, start, end, MaxUpstreamSeries)
 	if err != nil {
 		return nil, nil, err
 	}
+	// A server that honoured the limit returns exactly that many series and
+	// says nothing about what it dropped; mark it, since an unmarked cap is
+	// one the model reads as a complete answer.
+	upstreamCapped := len(sets) >= MaxUpstreamSeries
 
 	byMetric := map[string]map[string]map[string]bool{} // metric → label key → value set
 	for _, set := range sets {
@@ -494,7 +507,7 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 		names = names[:MaxMetadataMetrics]
 	}
 
-	meta, err := s.prom.metadata(ctx)
+	meta, err := s.prom.metadata(ctx, MaxUpstreamMetadata)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -525,19 +538,22 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 		metrics = append(metrics, m)
 	}
 
-	var dropNote, capNote string
+	var dropNote, capNote, upstreamNote string
 	if total > MaxMetadataMetrics {
 		dropNote = fmt.Sprintf("%d metrics dropped; sorted alphabetically. Narrow the match selector.", total-MaxMetadataMetrics)
 	}
 	if valuesCapped {
 		capNote = fmt.Sprintf("Some label keys show only the first %d values (sorted).", MaxLabelValues)
 	}
+	if upstreamCapped {
+		upstreamNote = fmt.Sprintf("The upstream series lookup hit its %d-series limit, so some metrics may be missing entirely. Narrow the match selector.", MaxUpstreamSeries)
+	}
 	payload, err := json.Marshal(metadataResult{
 		Metrics: metrics,
 		Truncation: metadataTruncation{
 			MetricsTotal:    total,
 			MetricsReturned: len(metrics),
-			Note:            joinNotes(dropNote, capNote),
+			Note:            joinNotes(dropNote, capNote, upstreamNote),
 		},
 	})
 	if err != nil {

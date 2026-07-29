@@ -210,9 +210,11 @@ type promMetadata struct {
 }
 
 // metadata calls /api/v1/metadata and returns metadata entries keyed by
-// metric name.
-func (c *promClient) metadata(ctx context.Context) (map[string][]promMetadata, error) {
-	data, err := c.get(ctx, "/api/v1/metadata", nil)
+// metric name. limit caps the number of metrics the server is asked for;
+// Prometheus versions that predate the parameter ignore it, so callers must
+// still cap what they use.
+func (c *promClient) metadata(ctx context.Context, limit int) (map[string][]promMetadata, error) {
+	data, err := c.get(ctx, "/api/v1/metadata", url.Values{"limit": {strconv.Itoa(limit)}})
 	if err != nil {
 		return nil, err
 	}
@@ -223,10 +225,18 @@ func (c *promClient) metadata(ctx context.Context) (map[string][]promMetadata, e
 	return d, nil
 }
 
-// series calls /api/v1/series with the given series selector and returns the
-// matching labelsets.
-func (c *promClient) series(ctx context.Context, match string) ([]map[string]string, error) {
-	data, err := c.get(ctx, "/api/v1/series", url.Values{"match[]": {match}})
+// series calls /api/v1/series with the given series selector, restricted to
+// the [start, end] window, and returns the matching labelsets. Without a
+// window Prometheus scans the full retention period. limit caps the number of
+// series the server is asked for; versions that predate the parameter ignore
+// it, so callers must still cap what they use.
+func (c *promClient) series(ctx context.Context, match string, start, end time.Time, limit int) ([]map[string]string, error) {
+	data, err := c.get(ctx, "/api/v1/series", url.Values{
+		"match[]": {match},
+		"start":   {formatTime(start)},
+		"end":     {formatTime(end)},
+		"limit":   {strconv.Itoa(limit)},
+	})
 	if err != nil {
 		return nil, err
 	}
