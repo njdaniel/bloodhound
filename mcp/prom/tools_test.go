@@ -312,6 +312,17 @@ func seriesJSON(t *testing.T, sets []map[string]string) string {
 	return string(body)
 }
 
+// seriesJSONWarned builds a canned /api/v1/series success body carrying the
+// warnings Prometheus attaches when a server-side limit truncated the result.
+func seriesJSONWarned(t *testing.T, sets []map[string]string, warnings ...string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"status": "success", "data": sets, "warnings": warnings})
+	if err != nil {
+		t.Fatalf("building series fixture: %v", err)
+	}
+	return string(body)
+}
+
 func TestSeriesMetadataAlphabeticalWithLabelValues(t *testing.T) {
 	fake := newFakeProm(t)
 	fake.set("/api/v1/series", 200, seriesJSON(t, []map[string]string{
@@ -413,24 +424,114 @@ func parseUnixParam(t *testing.T, params url.Values, key string) time.Time {
 	return time.UnixMilli(int64(secs * 1000))
 }
 
-// TestSeriesMetadataMarksUpstreamSeriesCap covers the case where the server
-// honours the limit: the caps the model is told about must include the one
-// applied upstream, or it reads a partial discovery as a complete one.
+// TestSeriesMetadataMarksUpstreamSeriesCap covers a server that honours the
+// limit. Prometheus signals that with a warning and nothing else — the result
+// itself looks complete — so an unmarked cap is one the model reads as a
+// complete answer.
 func TestSeriesMetadataMarksUpstreamSeriesCap(t *testing.T) {
 	fake := newFakeProm(t)
-	sets := make([]map[string]string, 0, MaxUpstreamSeries)
-	for i := 0; i < MaxUpstreamSeries; i++ {
-		sets = append(sets, map[string]string{"__name__": "metric_00", "pod": fmt.Sprintf("pod-%04d", i)})
-	}
-	fake.set("/api/v1/series", 200, seriesJSON(t, sets))
+	fake.set("/api/v1/series", 200, seriesJSONWarned(t, []map[string]string{
+		{"__name__": "metric_00", "pod": "a"},
+	}, "results truncated due to limit"))
 	ts := newTestToolServer(fake)
 
 	res, _, err := ts.handleSeriesMetadata(context.Background(), nil, seriesMetadataInput{Match: `{__name__=~".+"}`})
 	if err != nil {
 		t.Fatalf("handleSeriesMetadata: %v", err)
 	}
-	if note := decodeMetadata(t, res).Truncation.Note; !strings.Contains(note, "upstream series lookup") {
+	note := decodeMetadata(t, res).Truncation.Note
+	if !strings.Contains(note, "truncated the series lookup") {
 		t.Errorf("truncation note %q does not report the upstream series cap", note)
+	}
+	if got := strings.Count(note, "Narrow the match selector."); got != 1 {
+		t.Errorf("note %q repeats the narrow-the-selector advice %d times, want once", note, got)
+	}
+}
+
+// TestSeriesMetadataOldServerIgnoringLimit is the case the guardrails must not
+// get wrong: a Prometheus too old to know the limit parameter returns
+// everything. The output still has to be bounded by the client-side caps, and
+// the result must not claim an upstream truncation that never happened —
+// counting series instead of reading warnings gets this exactly backwards.
+func TestSeriesMetadataOldServerIgnoringLimit(t *testing.T) {
+	fake := newFakeProm(t)
+	const (
+		metrics       = 100
+		seriesPerName = 30 // 3000 series, well past MaxUpstreamSeries
+	)
+	sets := make([]map[string]string, 0, metrics*seriesPerName)
+	for m := 0; m < metrics; m++ {
+		for s := 0; s < seriesPerName; s++ {
+			sets = append(sets, map[string]string{
+				"__name__": fmt.Sprintf("metric_%03d", m),
+				"pod":      fmt.Sprintf("pod-%03d", s),
+			})
+		}
+	}
+	fake.set("/api/v1/series", 200, seriesJSON(t, sets)) // no warnings: limit ignored
+	ts := newTestToolServer(fake)
+
+	res, _, err := ts.handleSeriesMetadata(context.Background(), nil, seriesMetadataInput{Match: `{__name__=~".+"}`})
+	if err != nil {
+		t.Fatalf("handleSeriesMetadata: %v", err)
+	}
+	g := decodeMetadata(t, res)
+	if len(g.Metrics) != MaxMetadataMetrics || g.Truncation.MetricsReturned != MaxMetadataMetrics {
+		t.Errorf("returned %d metrics (truncation says %d), want the client-side cap of %d",
+			len(g.Metrics), g.Truncation.MetricsReturned, MaxMetadataMetrics)
+	}
+	if g.Truncation.MetricsTotal != metrics {
+		t.Errorf("metrics_total = %d, want the true %d the server returned", g.Truncation.MetricsTotal, metrics)
+	}
+	for _, m := range g.Metrics {
+		if len(m.Labels["pod"]) > MaxLabelValues {
+			t.Errorf("%s has %d pod values, want at most %d", m.Name, len(m.Labels["pod"]), MaxLabelValues)
+		}
+	}
+	if note := g.Truncation.Note; strings.Contains(note, "truncated the series lookup") {
+		t.Errorf("note %q claims an upstream truncation, but the server returned every series", note)
+	}
+}
+
+// TestSeriesMetadataMarksUpstreamMetadataCap covers the metadata limit, which
+// Prometheus applies without any warning and in target-iteration order: two
+// calls a minute apart can keep different metrics. Unmarked, that turns an
+// empty type/help — previously an unambiguous "no metadata registered" — into
+// a nondeterministic maybe.
+func TestSeriesMetadataMarksUpstreamMetadataCap(t *testing.T) {
+	fake := newFakeProm(t)
+	fake.set("/api/v1/series", 200, seriesJSON(t, []map[string]string{
+		{"__name__": "metric_00", "pod": "a"},
+	}))
+	entries := map[string]any{}
+	for i := 0; i < MaxUpstreamMetadata; i++ {
+		entries[fmt.Sprintf("other_metric_%04d", i)] = []map[string]string{{"type": "counter", "help": "h", "unit": ""}}
+	}
+	body, err := json.Marshal(map[string]any{"status": "success", "data": entries})
+	if err != nil {
+		t.Fatalf("building metadata fixture: %v", err)
+	}
+	fake.set("/api/v1/metadata", 200, string(body))
+	ts := newTestToolServer(fake)
+
+	res, _, err := ts.handleSeriesMetadata(context.Background(), nil, seriesMetadataInput{Match: `{__name__=~".+"}`})
+	if err != nil {
+		t.Fatalf("handleSeriesMetadata: %v", err)
+	}
+	g := decodeMetadata(t, res)
+	if g.Metrics[0].Type != "" {
+		t.Fatalf("fixture assumption broken: metric_00 got type %q", g.Metrics[0].Type)
+	}
+	if note := g.Truncation.Note; !strings.Contains(note, "metadata lookup hit") {
+		t.Errorf("truncation note %q does not report the metadata cap that made type/help empty", note)
+	}
+}
+
+// TestSeriesMetadataDescriptionQuotesLookback keeps the model-facing text
+// honest: the window it promises has to be the window the code applies.
+func TestSeriesMetadataDescriptionQuotesLookback(t *testing.T) {
+	if want := shortDuration(MetadataLookback); !strings.Contains(seriesMetadataDescription, want) {
+		t.Errorf("series_metadata description does not mention the %s discovery window: %q", want, seriesMetadataDescription)
 	}
 }
 

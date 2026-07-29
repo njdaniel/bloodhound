@@ -148,14 +148,26 @@ both to produce a result capped at 25 metrics. `limit` is advisory: Prometheus
 versions that predate it ignore the parameter, so the client-side caps stay
 authoritative and the output is bounded either way.
 
-Two consequences, both deliberate:
+Three consequences, all deliberate, all marked:
 
 - A metric with no samples in the last `MetadataLookback` is invisible to
   discovery. The tool description says so explicitly, because a model that
   reads absence as non-existence will stop investigating a real metric.
 - When the server honours the series limit, the result may be missing whole
-  metrics. That is a truncation like any other and is marked in
-  `truncation.note`.
+  metrics. Detected from the response's `warnings` (`"results truncated due to
+  limit"`), **not** from the result count: a server old enough to ignore
+  `limit` returns everything, and counting would report a truncation that
+  never happened. Marked in `truncation.note`.
+- When the server honours the metadata limit, metrics come back with an empty
+  `type` and `help`. `/api/v1/metadata` does not warn, and it fills its map by
+  walking active targets until the limit, so *which* metrics keep their
+  metadata is arbitrary and can differ between two calls. A full map is
+  therefore reported as possibly truncated — otherwise an empty `type`/`help`,
+  which used to mean "no metadata registered", becomes a nondeterministic
+  maybe on exactly the large Prometheus these bounds exist for.
+
+The truncation note joins one sentence per applied cap and appends the advice
+they share ("Narrow the match selector.") once.
 
 ### 2.3 Exact truncation strategy (`query_range`)
 

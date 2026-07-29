@@ -198,6 +198,13 @@ exist with older data, which the tool description tells the model. `limit` is
 ignored by Prometheus versions that predate it; the client-side caps are what
 guarantee a bounded result.
 
+Both upstream caps are marked in `truncation.note` when they bite. The series
+cap is detected from the response's `warnings`, not from the result count, so
+a server that ignores `limit` is never reported as having truncated. The
+metadata cap has no warning to read, so a full metadata map is reported as
+possibly truncated: an empty `type`/`help` then means "not fetched" rather
+than "not registered".
+
 ## Tests
 
 - Unit tests against an `httptest` fake Prometheus: step-clamp arithmetic,
