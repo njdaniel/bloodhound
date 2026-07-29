@@ -37,6 +37,18 @@ var ErrBadAlert = errors.New("orchestrator: unusable alert file")
 // crash loop from multiplying cost across resumes (spec 002 §4.3).
 var ErrBudgetExhausted = errors.New("orchestrator: budget exhausted by prior attempts")
 
+// ErrPipelineMismatch reports that the case being resumed records a different
+// pipeline version than this orchestrator walks. Resuming anyway would walk a
+// new phase order over checkpoints written under the old one: checkpoint
+// filenames carry the walk index, so a phase inserted ahead of another shifts
+// its index, leaves the old file orphaned on disk, and makes LoadCheckpoints
+// return that phase twice — which SumSpend then double-counts, inflating
+// `bloodhound cost` and the budget charged to the next resume. A case
+// recording no pipeline version at all is a mismatch too: it is not a v0 case,
+// it is a case of unknown provenance. There is deliberately no migration path;
+// refusing is the whole behaviour.
+var ErrPipelineMismatch = errors.New("orchestrator: case was written by a different pipeline version")
+
 // InvestigateFunc runs the investigation for a case and reports what it cost.
 // The orchestrator injects it rather than importing the hounds package, which
 // depends on this one; the CLI wires internal/agents/hounds.Run.
@@ -206,16 +218,27 @@ func (o *Orchestrator) Hunt(ctx context.Context, alertPath string) (Result, erro
 // with a completed checkpoint are loaded rather than re-executed, and the
 // first phase without one runs next (spec 002 §4.3). A failed checkpoint is
 // overwritten when its phase runs again.
+//
+// A case whose recorded pipeline version differs from this orchestrator's is
+// refused with ErrPipelineMismatch, before anything in the work dir is read
+// for resume or written to.
 func (o *Orchestrator) Resume(ctx context.Context, caseID string) (Result, error) {
 	if caseID == "" {
 		return Result{}, errors.New("orchestrator: no case ID given")
 	}
 	dir := filepath.Join(o.opts.Root, caseID)
-	st, err := openStore(dir, o.opts.rename)
+	// The case file is read before the store is opened: openStore creates the
+	// work dir skeleton, and a refused resume must leave the work dir exactly
+	// as it found it.
+	c, err := ReadCase(dir)
 	if err != nil {
 		return Result{}, fmt.Errorf("resuming case %s: %w", caseID, err)
 	}
-	c, err := st.readCase()
+	if c.Pipeline != o.opts.Pipeline.Version {
+		return Result{}, fmt.Errorf("resuming case %s: %w: case records pipeline %q, this orchestrator walks %q",
+			caseID, ErrPipelineMismatch, c.Pipeline, o.opts.Pipeline.Version)
+	}
+	st, err := openStore(dir, o.opts.rename)
 	if err != nil {
 		return Result{}, fmt.Errorf("resuming case %s: %w", caseID, err)
 	}

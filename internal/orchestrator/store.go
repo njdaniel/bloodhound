@@ -98,9 +98,6 @@ func (s *store) writeFile(rel string, data []byte) error {
 // skipping it (spec 002 §4.2).
 func (s *store) writeCase(c Case) error { return s.writeJSON(CaseFile, c) }
 
-// readCase loads the case file.
-func (s *store) readCase() (Case, error) { return ReadCase(s.dir) }
-
 // ReadCase loads the case file from a case work dir. It is the read-only door
 // into a work dir: it creates nothing, so inspection commands cannot leave
 // half-formed cases behind.

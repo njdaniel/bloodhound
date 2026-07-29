@@ -2,9 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -639,6 +641,183 @@ func TestHuntMissingAlertFile(t *testing.T) {
 	_, err := newTest(t, root, h, nil).Hunt(t.Context(), filepath.Join(t.TempDir(), "nope.json"))
 	if !errors.Is(err, ErrBadAlert) {
 		t.Fatalf("Hunt error = %v, want ErrBadAlert", err)
+	}
+}
+
+// v1Pipeline is a stand-in for a future walk: same phases as V0 so that New
+// accepts it (M2's plan phase has no implementation yet), but a different
+// version. The guard under test compares versions, not tables.
+func v1Pipeline() Pipeline {
+	p := V0()
+	p.Version = "v1"
+	return p
+}
+
+// dirState is a snapshot of every entry under dir, keyed by work-dir-relative
+// path. Files record their mode, size, modification time and content hash;
+// directories record their modification time, so a directory created or an
+// entry added under one shows up as a difference too.
+func dirState(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	state := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			state[rel] = fmt.Sprintf("dir mode=%s mtime=%d", info.Mode(), info.ModTime().UnixNano())
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		state[rel] = fmt.Sprintf("file mode=%s size=%d mtime=%d sha256=%x",
+			info.Mode(), info.Size(), info.ModTime().UnixNano(), sha256.Sum256(data))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshotting %s: %v", dir, err)
+	}
+	return state
+}
+
+// assertDirUnchanged fails the test with the specific paths that differ.
+func assertDirUnchanged(t *testing.T, before, after map[string]string) {
+	t.Helper()
+	for rel, want := range before {
+		got, ok := after[rel]
+		if !ok {
+			t.Errorf("work dir entry %s disappeared", rel)
+			continue
+		}
+		if got != want {
+			t.Errorf("work dir entry %s changed:\n before: %s\n  after: %s", rel, want, got)
+		}
+	}
+	for rel := range after {
+		if _, ok := before[rel]; !ok {
+			t.Errorf("work dir entry %s was created", rel)
+		}
+	}
+}
+
+// TestResumeRefusesPipelineVersionMismatch is issue #16: a case written under
+// one pipeline must not be walked by an orchestrator holding another. The
+// checkpoint filenames carry the walk index, so a shifted index would orphan a
+// checkpoint and make SumSpend double-count the phase it recorded.
+func TestResumeRefusesPipelineVersionMismatch(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseDir := filepath.Join(root, "c-20260728T101500-a1b2c3")
+
+	// A v0 case that failed mid-walk: exactly the state an operator resumes.
+	crashed := &fakeHound{spend: cannedSpend(), err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, crashed, nil).Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	if stored, err := ReadCase(caseDir); err != nil {
+		t.Fatalf("ReadCase: %v", err)
+	} else if stored.Pipeline != PipelineV0 {
+		t.Fatalf("case pipeline = %q, want %q", stored.Pipeline, PipelineV0)
+	}
+
+	// Remove one skeleton directory first: opening the store would recreate
+	// it, so its continued absence is what proves the refusal happens before
+	// the work dir is touched at all.
+	if err := os.Remove(filepath.Join(caseDir, CaptureDir, "mcp")); err != nil {
+		t.Fatalf("removing capture dir: %v", err)
+	}
+	before := dirState(t, caseDir)
+
+	forbidden := &fakeHound{forbidden: t}
+	o := newTest(t, root, forbidden, func(opts *Options) { opts.Pipeline = v1Pipeline() })
+	_, err := o.Resume(t.Context(), "c-20260728T101500-a1b2c3")
+	if !errors.Is(err, ErrPipelineMismatch) {
+		t.Fatalf("Resume error = %v, want ErrPipelineMismatch", err)
+	}
+	for _, want := range []string{"c-20260728T101500-a1b2c3", `"v0"`, `"v1"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to name %s", err, want)
+		}
+	}
+	if forbidden.count() != 0 {
+		t.Errorf("investigate ran %d times on a refused resume, want 0", forbidden.count())
+	}
+
+	assertDirUnchanged(t, before, dirState(t, caseDir))
+
+	// Nothing was added to the ledger either: `bloodhound cost` still sees the
+	// two checkpoints the v0 run wrote, and no third.
+	cps := readCheckpoints(t, caseDir)
+	if len(cps) != 2 {
+		t.Errorf("checkpoints after a refused resume = %d, want the 2 the v0 run wrote", len(cps))
+	}
+}
+
+// TestResumeUnderMatchingNonDefaultPipeline pins that the guard compares the
+// case against the orchestrator's own version rather than hard-coding v0.
+func TestResumeUnderMatchingNonDefaultPipeline(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	v1 := func(opts *Options) { opts.Pipeline = v1Pipeline() }
+
+	crashed := &fakeHound{spend: cannedSpend(), err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, crashed, v1).Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+
+	fixed := &fakeHound{finding: cannedFinding(), spend: cannedSpend()}
+	res, err := newTest(t, root, fixed, v1).Resume(t.Context(), "c-20260728T101500-a1b2c3")
+	if err != nil {
+		t.Fatalf("Resume under a matching v1 pipeline: %v", err)
+	}
+	if res.Case.Phase != PhaseDone {
+		t.Errorf("resumed phase = %q, want %q", res.Case.Phase, PhaseDone)
+	}
+	if res.Case.Pipeline != "v1" {
+		t.Errorf("resumed case pipeline = %q, want %q", res.Case.Pipeline, "v1")
+	}
+	if fixed.count() != 1 {
+		t.Errorf("hound ran %d times, want 1 (the failed investigate re-run)", fixed.count())
+	}
+}
+
+// TestResumeCaseWithNoRecordedPipeline covers a case file of unknown
+// provenance: an absent version is a mismatch, not an implicit v0.
+func TestResumeCaseWithNoRecordedPipeline(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseDir := filepath.Join(root, "c-20260728T101500-a1b2c3")
+
+	crashed := &fakeHound{spend: cannedSpend(), err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, crashed, nil).Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	stored, err := ReadCase(caseDir)
+	if err != nil {
+		t.Fatalf("ReadCase: %v", err)
+	}
+	stored.Pipeline = ""
+	data, err := json.MarshalIndent(stored, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling case: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(caseDir, CaseFile), append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("rewriting case file: %v", err)
+	}
+
+	forbidden := &fakeHound{forbidden: t}
+	if _, err := newTest(t, root, forbidden, nil).Resume(t.Context(), "c-20260728T101500-a1b2c3"); !errors.Is(err, ErrPipelineMismatch) {
+		t.Fatalf("Resume error = %v, want ErrPipelineMismatch", err)
 	}
 }
 

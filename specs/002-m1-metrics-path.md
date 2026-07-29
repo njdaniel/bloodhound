@@ -379,12 +379,21 @@ derived by summing checkpoints — no separate ledger to drift.
 `bloodhound hunt --resume <case-id>` (same binary path the M2 `replay` command
 will build on):
 
-1. Read `case.json`; enumerate `checkpoints/`.
-2. Every phase with a `completed` checkpoint is **loaded, never re-executed** —
+1. Read `case.json`. If the `pipeline` version it records differs from the
+   version the running orchestrator walks, **refuse the case** — the resume
+   fails and writes nothing: no checkpoint, no `case.json` update, no
+   captures. Checkpoint *filenames* carry the walk index (`02-investigate.json`),
+   so walking a different table over old checkpoints would shift a phase's
+   index, orphan the file written under the old one, and make the checkpoint
+   sum double-count that phase's spend. There is deliberately **no migration
+   path**: refusing is the whole behaviour, and a case file that records no
+   pipeline version at all is a mismatch too.
+2. Enumerate `checkpoints/`.
+3. Every phase with a `completed` checkpoint is **loaded, never re-executed** —
    its `output` is deserialized as that phase's result.
-3. Walking the transition table, the first phase without a completed
+4. Walking the transition table, the first phase without a completed
    checkpoint runs next (a `failed` checkpoint is overwritten on re-run).
-4. Spend already recorded is counted toward budgets on resume — a crash loop
+5. Spend already recorded is counted toward budgets on resume — a crash loop
    must not multiply cost.
 
 Acceptance test for this section, literally: `kill -9` mid-investigate,
