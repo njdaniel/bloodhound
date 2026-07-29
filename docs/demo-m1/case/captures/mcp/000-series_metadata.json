@@ -1,0 +1,11 @@
+{
+  "seq": 0,
+  "tool": "series_metadata",
+  "args": {
+    "match": "{namespace=\"shop\"}"
+  },
+  "result": {
+    "text": "{\"metrics\":[{\"name\":\"kube_pod_container_status_ready\",\"type\":\"gauge\",\"help\":\"Describes whether the containers readiness check succeeded.\",\"labels\":{\"container\":[\"checkout\"],\"instance\":[\"127.0.0.1:35647\"],\"job\":[\"kube-state-metrics\"],\"namespace\":[\"shop\"],\"pod\":[\"checkout-6c4a\",\"checkout-7d9f\"]}},{\"name\":\"kube_pod_container_status_restarts_total\",\"type\":\"counter\",\"help\":\"The number of container restarts per container.\",\"labels\":{\"container\":[\"checkout\"],\"instance\":[\"127.0.0.1:35647\"],\"job\":[\"kube-state-metrics\"],\"namespace\":[\"shop\"],\"pod\":[\"checkout-6c4a\",\"checkout-7d9f\"]}},{\"name\":\"kube_pod_container_status_waiting_reason\",\"type\":\"gauge\",\"help\":\"Describes the reason the container is currently in waiting state.\",\"labels\":{\"container\":[\"checkout\"],\"instance\":[\"127.0.0.1:35647\"],\"job\":[\"kube-state-metrics\"],\"namespace\":[\"shop\"],\"pod\":[\"checkout-6c4a\",\"checkout-7d9f\"],\"reason\":[\"CrashLoopBackOff\",\"ImagePullBackOff\"]}}],\"truncation\":{\"metrics_total\":3,\"metrics_returned\":3}}",
+    "capture_ref": "mcp/000-series_metadata.json"
+  }
+}

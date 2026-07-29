@@ -1,0 +1,16 @@
+{
+  "id": "c-20260729T000956-5afef8",
+  "alert_name": "KubePodCrashLooping",
+  "labels": {
+    "alertname": "KubePodCrashLooping",
+    "container": "checkout",
+    "namespace": "shop",
+    "pod": "checkout-7d9f",
+    "severity": "critical"
+  },
+  "firing_since": "2026-07-28T10:05:00Z",
+  "phase": "done",
+  "work_dir": "/tmp/claude-1000/-home-nick-code-github-com-njdaniel-bloodhound/4d253352-622f-44df-a553-5ed8d93cb29b/scratchpad/demowork/c-20260729T000956-5afef8",
+  "alert_path": "/tmp/TestHuntAgainstRealPrometheus3901518973/001/alert.json",
+  "pipeline": "v0"
+}

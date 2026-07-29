@@ -1,0 +1,26 @@
+bloodhound report — case c-20260729T000956-5afef8
+==============================================================================
+alert:   KubePodCrashLooping
+firing:  2026-07-28T10:05:00Z
+scope:   namespace=shop pod=checkout-7d9f container=checkout severity=critical
+hound:   metrics
+
+HYPOTHESIS  (confidence 0.78)
+onset 2026-07-29T00:07:56Z
+checkout-7d9f is in CrashLoopBackOff and its restart counter is still climbing
+across the alert window; the container never reaches a ready state, which is
+the signature of a container that fails immediately on start rather than one
+degrading under load.
+
+EVIDENCE
+  #   TOOL           QUERY                          OBSERVED                     CAPTURE
+  1   query_range    kube_pod_container_status_res… the restart counter rises m… mcp/001-query_range.json
+
+DEAD ENDS
+  - a traffic spike overloaded checkout
+    ruled out by: no request-rate series exists in this namespace's metric
+                  surface, so the theory cannot be supported from metrics
+                  alone
+
+------------------------------------------------------------------------------
+spend: 7100 in + 620 out tokens · $0.0000 · 2 tool calls · 6ms

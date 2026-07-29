@@ -1,0 +1,72 @@
+# The M1 demo workload: one deployment shipped with a broken image, one
+# healthy deployment alongside it so the investigation has to discriminate
+# rather than report the only thing it can see.
+#
+# This is eval scenario S01 (evals/scenarios/S01-bad-image-tag) reduced to
+# what a metrics-only hound can observe: a container that exits immediately on
+# start, so the pod lands in CrashLoopBackOff and kube-state-metrics reports a
+# restart counter that keeps climbing.
+#
+#   kubectl apply -f docs/demo-m1/broken-workload.yaml
+#
+# Nothing here needs a registry: both deployments run stock busybox, and the
+# "bad build" is modelled by the command rather than by a tag that does not
+# resolve. A tag that does not resolve produces ImagePullBackOff, which is a
+# different (and easier) signal than the crash loop S01 describes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: shop
+  labels:
+    app: checkout
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+        - name: checkout
+          image: busybox:1.36
+          # Stands in for image tag v2.1.4, which panics on boot.
+          command: ["sh", "-c", "echo 'checkout v2.1.4 starting'; echo 'panic: missing config key PAYMENTS_URL' >&2; exit 1"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: shop
+  labels:
+    app: cart
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+        - name: cart
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do sleep 30; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi

@@ -1,0 +1,16 @@
+# Prometheus config for the M1 demo: scrape the kube-state-metrics instance
+# that is watching the kind cluster. Five seconds is far faster than a real
+# deployment would run, and it is deliberate — a demo should not spend a
+# minute waiting for its second data point.
+#
+# See docs/demo-m1.md for the commands that use this file.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "kube-state-metrics"
+    static_configs:
+      - targets:
+          - "127.0.0.1:18080"
