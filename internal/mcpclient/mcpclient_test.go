@@ -331,6 +331,73 @@ func TestCaptureSequenceContinuesAfterResume(t *testing.T) {
 	}
 }
 
+// TestCaptureSequenceContinuesPastThreeDigits pins the resume behaviour once
+// a case has left four-digit capture files behind: a fixed-width parser skips
+// 1000-echo.json, restarts numbering, and overwrites earlier captures.
+func TestCaptureSequenceContinuesPastThreeDigits(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "mcp")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	seeded := []string{"000-echo.json", "999-echo.json", "1000-echo.json"}
+	for _, name := range seeded {
+		if err := os.WriteFile(filepath.Join(sub, name), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("seeding capture file %s: %v", name, err)
+		}
+	}
+
+	s, _ := newSession(t, Config{CaptureDir: dir})
+	res, err := s.CallTool(context.Background(), "echo", json.RawMessage(`{"text":"resumed"}`))
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.CaptureRef != "mcp/1001-echo.json" {
+		t.Errorf("CaptureRef = %q, want mcp/1001-echo.json", res.CaptureRef)
+	}
+	for _, name := range seeded {
+		data, err := os.ReadFile(filepath.Join(sub, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		if string(data) != "{}\n" {
+			t.Errorf("%s was overwritten: sequence numbering collided", name)
+		}
+	}
+}
+
+func TestNextSeqParsesSequencePrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []string
+		want  int
+	}{
+		{"empty dir", nil, 0},
+		{"three digits", []string{"007-echo.json"}, 8},
+		{"four digits", []string{"1000-echo.json"}, 1001},
+		{"mixed widths", []string{"999-echo.json", "1234-echo.json"}, 1235},
+		{"tool name contains a dash", []string{"012-query-range.json"}, 13},
+		{"no sequence prefix", []string{"notes.json", "-echo.json", "abc-echo.json"}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o644); err != nil {
+					t.Fatalf("seeding %s: %v", name, err)
+				}
+			}
+			got, err := nextSeq(dir)
+			if err != nil {
+				t.Fatalf("nextSeq: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("nextSeq = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCaptureWriteFailureFailsCall(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root; read-only dirs do not block writes")

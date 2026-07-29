@@ -62,7 +62,10 @@ func safeName(name string) string {
 
 // nextSeq returns one past the highest sequence number already present in
 // dir, or 0 for an empty directory. Mirrors the LLM capture middleware so
-// both capture streams resume identically (spec 002 §4.3).
+// both capture streams resume identically (spec 002 §4.3). The sequence
+// prefix is every digit up to the first '-', not a fixed three: %03d is a
+// minimum width, so past seq 999 filenames grow to 1000-<tool>.json and a
+// fixed-width parser would skip them and restart numbering into a collision.
 func nextSeq(dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -70,12 +73,8 @@ func nextSeq(dir string) (int, error) {
 	}
 	next := 0
 	for _, e := range entries {
-		name := e.Name()
-		if len(name) < 4 || name[3] != '-' {
-			continue
-		}
-		n, err := strconv.Atoi(name[:3])
-		if err != nil {
+		n, ok := seqPrefix(e.Name())
+		if !ok {
 			continue
 		}
 		if n+1 > next {
@@ -83,4 +82,25 @@ func nextSeq(dir string) (int, error) {
 		}
 	}
 	return next, nil
+}
+
+// seqPrefix parses the leading run of digits before the first '-' in a
+// capture filename. It reports false for any name that does not start with
+// at least one digit followed by '-'.
+func seqPrefix(name string) (int, bool) {
+	i := strings.IndexByte(name, '-')
+	if i <= 0 {
+		return 0, false
+	}
+	digits := name[:i]
+	for j := 0; j < len(digits); j++ {
+		if digits[j] < '0' || digits[j] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
