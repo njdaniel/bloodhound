@@ -560,6 +560,197 @@ func TestBudgetExhaustedByPriorAttemptsFailsThePhase(t *testing.T) {
 	}
 }
 
+// phaseClock returns an Options.Now that advances by steps[i] on its i-th call
+// and by one second once steps runs out, so a test can give each phase the
+// wall-clock duration it needs. A phase's duration is the clock gap between
+// the runPhase calls that bracket it: with the walk's calls counted in order,
+// steps controls which phase burns how much.
+func phaseClock(steps ...time.Duration) func() time.Time {
+	base := time.Date(2026, 7, 28, 10, 15, 0, 0, time.UTC)
+	var i int
+	var elapsed time.Duration
+	return func() time.Time {
+		step := time.Second
+		if i < len(steps) {
+			step = steps[i]
+		}
+		i++
+		elapsed += step
+		return base.Add(elapsed)
+	}
+}
+
+// wantWallMS asserts the recorded per-phase wall clock, so a test that depends on
+// the fake clock's call ordering fails on the fixture rather than on the
+// property it is really about.
+func wantWallMS(t *testing.T, cps []Checkpoint, phase Phase, want time.Duration) {
+	t.Helper()
+	for _, cp := range cps {
+		if cp.Phase != phase {
+			continue
+		}
+		if got := cp.Spend.WallMS; got != want.Milliseconds() {
+			t.Fatalf("%s checkpoint wall clock = %dms, want %dms", phase, got, want.Milliseconds())
+		}
+		return
+	}
+	t.Fatalf("no %s checkpoint among %d", phase, len(cps))
+}
+
+// TestInvestigateBudgetExcludesIntakeWallClock is issue #17: the hound's budget
+// caps one hound run, but wall clock accrues in every phase, so charging it
+// from the case total bills the hound for time it never had.
+func TestInvestigateBudgetExcludesIntakeWallClock(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 60 * time.Second}
+
+	// A slow intake (20s), then an investigate that burns 5s and fails.
+	burned := Spend{InputTokens: 400, OutputTokens: 100, USD: 0.01, ToolCalls: 3}
+	first := &fakeHound{spend: burned, err: errors.New("hound crashed")}
+	o := newTest(t, root, first, func(opts *Options) {
+		opts.Budget = budget
+		opts.Now = phaseClock(0, 20*time.Second, 0, 5*time.Second)
+	})
+	if _, err := o.Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	cps := readCheckpoints(t, filepath.Join(root, caseID))
+	wantWallMS(t, cps, PhaseIntake, 20*time.Second)
+	wantWallMS(t, cps, PhaseInvestigate, 5*time.Second)
+
+	second := &fakeHound{finding: cannedFinding()}
+	if _, err := newTest(t, root, second, func(opts *Options) { opts.Budget = budget }).
+		Resume(t.Context(), caseID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	got := second.lastBudget(t)
+
+	// Only the failed investigate's 5s is charged; intake's 20s is not.
+	if want := budget.MaxWallClock - 5*time.Second; got.MaxWallClock != want {
+		t.Errorf("resumed wall-clock budget = %s, want %s (intake's 20s must not be charged to the hound)",
+			got.MaxWallClock, want)
+	}
+	// Tokens and tool calls only ever accrue in investigate, so they are
+	// charged exactly as before.
+	if want := budget.MaxTokens - burned.Tokens(); got.MaxTokens != want {
+		t.Errorf("resumed token budget = %d, want %d", got.MaxTokens, want)
+	}
+	if want := budget.MaxToolCalls - burned.ToolCalls; got.MaxToolCalls != want {
+		t.Errorf("resumed tool-call budget = %d, want %d", got.MaxToolCalls, want)
+	}
+	// The case ledger still carries every phase's spend: the budget is scoped,
+	// the accounting is not.
+	if got := SumSpend(readCheckpoints(t, filepath.Join(root, caseID))).WallMS; got < (20 * time.Second).Milliseconds() {
+		t.Errorf("case total wall clock = %dms, want intake's 20s still counted", got)
+	}
+}
+
+// reportFirstPipeline is a stand-in for an M2 walk in which a phase that
+// records wall clock precedes an investigate re-run — the shape verify →
+// replan will have. The v0 walk is linear, so this is the only way to test
+// that a non-investigate phase's wall clock stays off the hound's cap from
+// both sides.
+func reportFirstPipeline() Pipeline {
+	return Pipeline{
+		Version: "test-report-first",
+		Start:   PhaseIntake,
+		Next: map[Phase]Phase{
+			PhaseIntake:      PhaseReport,
+			PhaseReport:      PhaseInvestigate,
+			PhaseInvestigate: PhaseDone,
+		},
+	}
+}
+
+func TestInvestigateBudgetExcludesOtherPhasesWallClock(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 60 * time.Second}
+	pipeline := reportFirstPipeline()
+
+	// Intake 4s, report 25s (the report phase reads the clock a third time for
+	// its timestamp), investigate 3s before the hound fails.
+	first := &fakeHound{err: errors.New("hound crashed")}
+	o := newTest(t, root, first, func(opts *Options) {
+		opts.Budget = budget
+		opts.Pipeline = pipeline
+		opts.Now = phaseClock(0, 4*time.Second, 0, 25*time.Second, 0, 0, 3*time.Second)
+	})
+	if _, err := o.Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	cps := readCheckpoints(t, filepath.Join(root, caseID))
+	wantWallMS(t, cps, PhaseIntake, 4*time.Second)
+	wantWallMS(t, cps, PhaseReport, 25*time.Second)
+	wantWallMS(t, cps, PhaseInvestigate, 3*time.Second)
+
+	second := &fakeHound{finding: cannedFinding()}
+	if _, err := newTest(t, root, second, func(opts *Options) {
+		opts.Budget = budget
+		opts.Pipeline = pipeline
+	}).Resume(t.Context(), caseID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if want := budget.MaxWallClock - 3*time.Second; second.lastBudget(t).MaxWallClock != want {
+		t.Errorf("resumed wall-clock budget = %s, want %s (intake's 4s and report's 25s must not be charged to the hound)",
+			second.lastBudget(t).MaxWallClock, want)
+	}
+}
+
+// TestInvestigateBudgetChargesPriorInvestigateAttempts is the other half of
+// issue #17: scoping the budget to the phase must not cost the crash-loop
+// guard (spec 002 §4.3). Each failed investigate still shrinks the next
+// attempt's budget, and enough of them exhaust it.
+func TestInvestigateBudgetChargesPriorInvestigateAttempts(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 10 * time.Second}
+
+	// Intake burns far more than the whole hound budget, so charging the case
+	// total would exhaust it before the second attempt ever ran; investigate
+	// burns 6s per attempt.
+	first := &fakeHound{err: errors.New("hound crashed")}
+	o := newTest(t, root, first, func(opts *Options) {
+		opts.Budget = budget
+		opts.Now = phaseClock(0, 30*time.Second, 0, 6*time.Second)
+	})
+	if _, err := o.Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	if got := first.lastBudget(t).MaxWallClock; got != budget.MaxWallClock {
+		t.Errorf("first wall-clock budget = %s, want the full %s", got, budget.MaxWallClock)
+	}
+
+	// Second attempt: charged for the first attempt's 6s, and only that.
+	second := &fakeHound{err: errors.New("hound crashed again")}
+	_, err := newTest(t, root, second, func(opts *Options) {
+		opts.Budget = budget
+		opts.Now = phaseClock(0, 6*time.Second)
+	}).Resume(t.Context(), caseID)
+	if err == nil {
+		t.Fatal("Resume succeeded, want the hound's failure")
+	}
+	if want := budget.MaxWallClock - 6*time.Second; second.lastBudget(t).MaxWallClock != want {
+		t.Fatalf("second wall-clock budget = %s, want %s (prior investigate spend must be charged)",
+			second.lastBudget(t).MaxWallClock, want)
+	}
+
+	// Third attempt: 12s of investigate wall clock against a 10s cap is the
+	// crash loop stopping.
+	third := &fakeHound{finding: cannedFinding()}
+	_, err = newTest(t, root, third, func(opts *Options) { opts.Budget = budget }).Resume(t.Context(), caseID)
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("third Resume error = %v, want ErrBudgetExhausted", err)
+	}
+	if third.count() != 0 {
+		t.Errorf("hound ran %d times on an exhausted budget, want 0", third.count())
+	}
+}
+
 func TestPhaseTimeoutWritesFailedCheckpointAndCaseResumes(t *testing.T) {
 	root := t.TempDir()
 	alert := writeAlert(t, t.TempDir(), alertFixture)
