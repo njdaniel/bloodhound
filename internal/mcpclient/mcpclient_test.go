@@ -53,7 +53,7 @@ func fakeServer(t *testing.T) string {
 		fakeBin = filepath.Join(buildDir, "fakeserver")
 		out, err := exec.Command("go", "build", "-o", fakeBin, "./testdata/fakeserver").CombinedOutput()
 		if err != nil {
-			buildErr = fmt.Errorf("building fakeserver: %v\n%s", err, out)
+			buildErr = fmt.Errorf("building fakeserver: %w\n%s", err, out)
 		}
 	})
 	if buildErr != nil {

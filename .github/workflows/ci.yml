@@ -20,7 +20,22 @@ jobs:
       - name: build
         run: go build ./...
       - name: test
-        run: go test ./...
+        run: go test -race ./...
+
+  # Separate from `build` so a lint failure and a test failure are
+  # distinguishable at a glance, and so lint results arrive even when the
+  # tests are red. Linter set and exclusions live in .golangci.yml.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Keep in sync with GOLANGCI_VERSION in the Makefile.
+          version: v2.12.2
 
   # Real-Prometheus integration tests. A separate job from `build` because it
   # pulls a container image and takes minutes rather than seconds. It is NOT
@@ -35,3 +50,4 @@ jobs:
           go-version-file: go.mod
       - name: integration tests
         run: make test-integration
+

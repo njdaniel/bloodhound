@@ -63,7 +63,7 @@ func (r *Retry) Complete(ctx context.Context, req llm.Request) (llm.Response, er
 	for attempt := 1; attempt <= r.cfg.MaxAttempts; attempt++ {
 		if attempt > 1 {
 			if err := r.sleep(ctx, backoff); err != nil {
-				return llm.Response{}, fmt.Errorf("waiting to retry after transient error (%v): %w", lastErr, err)
+				return llm.Response{}, fmt.Errorf("waiting to retry after transient error (%w): %w", lastErr, err)
 			}
 			backoff = min(backoff*2, r.cfg.MaxBackoff)
 		}

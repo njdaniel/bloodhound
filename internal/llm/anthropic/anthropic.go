@@ -74,7 +74,7 @@ func (p *Provider) buildParams(req llm.Request) (sdk.MessageNewParams, error) {
 		model = p.cfg.Model
 	}
 	params := sdk.MessageNewParams{
-		Model:     sdk.Model(model),
+		Model:     model,
 		MaxTokens: int64(req.MaxTokens),
 	}
 	if req.System != "" {
