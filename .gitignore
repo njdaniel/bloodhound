@@ -1,5 +1,8 @@
 bin/
 *.exe
+
+# Agent worktrees live here; .claude/commands/ is tracked, this is not.
+.claude/worktrees/
 .env
 evals/results/
 cases/
