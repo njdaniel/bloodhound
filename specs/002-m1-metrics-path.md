@@ -386,6 +386,39 @@ work/<case-id>/
 └── report.txt
 ```
 
+`case.json` is the serialized `orchestrator.Case`: the alert as intake parsed
+it, plus the cursor a resume reads.
+
+```json
+{
+  "id": "c-20260728T101500-a1b2c3",
+  "alert_name": "PodCrashLooping",
+  "labels": { "namespace": "shop", "pod": "checkout-7d9f4b8c6-x2ktn" },
+  "firing_since": "2026-07-28T10:12:30Z",
+  "phase": "investigate",
+  "work_dir": "work/c-20260728T101500-a1b2c3",
+  "alert_path": "fixture.json",
+  "pipeline": "v0"
+}
+```
+
+- `phase` is the phase to run **next** — not the one that last completed — or
+  `done`/`failed`. That is what makes the file a cursor.
+- `alert_name`, `labels` and `firing_since` are filled by the intake phase.
+  None of them are `omitempty`, so a case file written before intake completes
+  carries their zero values (`""`, `null`, `0001-01-01T00:00:00Z`) rather than
+  omitting the keys.
+- `work_dir` is recorded for readers of the file; a resume trusts the path it
+  was given instead, so a work dir that has been moved or copied still resumes.
+- `alert_path` is the alert file the case was opened from, kept so that a
+  resume can re-run a failed intake against the corrected file without the
+  operator having to re-supply it (§4.3).
+- `pipeline` is the version of the transition table this case is being walked
+  with (`v0` in M1) — the field the §4.3 resume refusal turns on.
+
+`alert_path` and `pipeline` are `omitempty`: an unset value is an absent key,
+not an empty string. An absent `pipeline` is a mismatch, not a wildcard (§4.3).
+
 Checkpoint file schema (`schema_version` guards future migrations):
 
 ```json

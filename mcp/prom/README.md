@@ -219,5 +219,8 @@ mean "not fetched" rather than "not registered".
   (`go test ./mcp/prom/ -run TestGolden -update` to regenerate).
 - Stdio conformance: the built binary is spawned by the go-sdk client; tool
   names and input schemas asserted, each tool called once.
-- Integration against a real Prometheus container is a separate milestone item
-  (`make test-integration`, spec 002 §5).
+- Integration (`-tags integration`, `make test-integration`): the built binary
+  is driven over stdio against a real Prometheus container scraping a
+  test-owned `/metrics` endpoint, to catch wire-format drift the fake cannot.
+  CI runs it in its own job on every PR — no API key, no paid calls. Without
+  docker the tests skip, which is why `make check` does not depend on them.
