@@ -57,30 +57,30 @@ func TestNextParsesSequencePrefix(t *testing.T) {
 // first '-', at any width, and three digits are not special.
 func TestPrefixParsesVariableWidth(t *testing.T) {
 	tests := []struct {
-		name    string
-		want    int
-		wantOK  bool
-		filName string
+		name     string
+		want     int
+		wantOK   bool
+		fileName string
 	}{
-		{filName: "000-hound.json", want: 0, wantOK: true, name: "zero"},
-		{filName: "005-hound.json", want: 5, wantOK: true, name: "three digits"},
-		{filName: "999-hound.json", want: 999, wantOK: true, name: "last three-digit value"},
-		{filName: "1000-hound.json", want: 1000, wantOK: true, name: "four digits"},
-		{filName: "1234567-query-range.json", want: 1234567, wantOK: true, name: "seven digits"},
-		{filName: "5-hound.json", want: 5, wantOK: true, name: "one digit"},
-		{filName: "-hound.json", wantOK: false, name: "no digits before the dash"},
-		{filName: "abc-hound.json", wantOK: false, name: "non-digit prefix"},
-		{filName: "01a-hound.json", wantOK: false, name: "digits then a letter"},
-		{filName: "notes.json", wantOK: false, name: "no dash at all"},
+		{fileName: "000-hound.json", want: 0, wantOK: true, name: "zero"},
+		{fileName: "005-hound.json", want: 5, wantOK: true, name: "three digits"},
+		{fileName: "999-hound.json", want: 999, wantOK: true, name: "last three-digit value"},
+		{fileName: "1000-hound.json", want: 1000, wantOK: true, name: "four digits"},
+		{fileName: "1234567-query-range.json", want: 1234567, wantOK: true, name: "seven digits"},
+		{fileName: "5-hound.json", want: 5, wantOK: true, name: "one digit"},
+		{fileName: "-hound.json", wantOK: false, name: "no digits before the dash"},
+		{fileName: "abc-hound.json", wantOK: false, name: "non-digit prefix"},
+		{fileName: "01a-hound.json", wantOK: false, name: "digits then a letter"},
+		{fileName: "notes.json", wantOK: false, name: "no dash at all"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := Prefix(tt.filName)
+			got, ok := Prefix(tt.fileName)
 			if ok != tt.wantOK {
-				t.Fatalf("Prefix(%q) ok = %v, want %v", tt.filName, ok, tt.wantOK)
+				t.Fatalf("Prefix(%q) ok = %v, want %v", tt.fileName, ok, tt.wantOK)
 			}
 			if ok && got != tt.want {
-				t.Errorf("Prefix(%q) = %d, want %d", tt.filName, got, tt.want)
+				t.Errorf("Prefix(%q) = %d, want %d", tt.fileName, got, tt.want)
 			}
 		})
 	}
