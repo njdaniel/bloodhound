@@ -14,8 +14,9 @@ import (
 	"github.com/njdaniel/bloodhound/internal/intake"
 )
 
-// Per-phase timeouts (spec 002 §4.1). The investigate phase gets the hound's
-// own wall-clock budget plus a grace window, so the hound hits its budget and
+// Per-phase timeouts (spec 002 §4.1). The investigate phase gets the wall
+// clock the hound has left — its cap minus what prior attempts at the phase
+// already spent — plus a grace window, so the hound hits its budget and
 // submits a best-effort finding before the orchestrator's deadline fires: the
 // phase timeout is the backstop for a wedged hound, not the normal control.
 const (
@@ -286,6 +287,14 @@ type run struct {
 	// phaseSpend is set by a phase to report what it consumed, and consumed
 	// by runPhase when it writes the checkpoint.
 	phaseSpend Spend
+	// phaseRefused is set by a phase that declined to run at all — today only
+	// the investigate budget check. The attempt did no work, so runPhase
+	// records no wall clock for it: otherwise every futile resume against an
+	// exhausted budget would add its own measured wall to the checkpoint, and
+	// the ledger `bloodhound cost` reads would climb for a phase that never
+	// ran. A phase that ran and then failed is not refused — its spend is real
+	// and is still charged (spec 002 §4.3).
+	phaseRefused bool
 
 	// finding and artifacts carry phase outputs between phases.
 	finding   Finding
@@ -397,18 +406,23 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	if !ok {
 		return fmt.Errorf("case %s: phase %q has no implementation", r.c.ID, phase)
 	}
-	timeout := o.phaseTimeout(phase)
+	// The deadline is sized from the same per-phase spend the budget check
+	// charges, so the two numbers agree about how much time the phase may have.
+	timeout := o.phaseTimeout(phase, r.priorByPhase[phase])
 	started := o.now()
 
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	r.phaseSpend = Spend{}
+	r.phaseRefused = false
 	out, phaseErr := fn(pctx, r)
 	finished := o.now()
 
 	spend := r.phaseSpend
-	spend.WallMS = finished.Sub(started).Milliseconds()
+	if !r.phaseRefused {
+		spend.WallMS = finished.Sub(started).Milliseconds()
+	}
 	r.prior = r.prior.Add(spend)
 	r.priorByPhase[phase] = r.priorByPhase[phase].Add(spend)
 
@@ -458,16 +472,30 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 }
 
 // phaseTimeout returns the deadline for one phase (spec 002 §4.1).
-func (o *Orchestrator) phaseTimeout(phase Phase) time.Duration {
+//
+// spent is the phase's own recorded spend — what remainingBudget charges it.
+// The investigate deadline is sized from the wall clock the hound has left
+// rather than from the full cap, so a resume with four seconds of budget
+// remaining gets a deadline that says four seconds (plus the grace window) and
+// not the three and a half minutes a fresh case would get. A disabled
+// (negative) cap has no remainder to compute, so it keeps the default backstop.
+func (o *Orchestrator) phaseTimeout(phase Phase, spent Spend) time.Duration {
 	if o.opts.timeout != nil {
 		return o.opts.timeout(phase)
 	}
 	switch phase {
 	case PhaseInvestigate:
-		if o.opts.Budget.MaxWallClock > 0 {
-			return o.opts.Budget.MaxWallClock + InvestigateGrace
+		wallCap := o.opts.Budget.MaxWallClock
+		if wallCap <= 0 {
+			return DefaultMaxWallClock + InvestigateGrace
 		}
-		return DefaultMaxWallClock + InvestigateGrace
+		remaining := wallCap - time.Duration(spent.WallMS)*time.Millisecond
+		if remaining < 0 {
+			// The budget check refuses the phase outright; the grace window is
+			// only there to keep the refusal from being reported as a timeout.
+			remaining = 0
+		}
+		return remaining + InvestigateGrace
 	case PhaseReport:
 		return ReportTimeout
 	default:
@@ -520,6 +548,10 @@ func (o *Orchestrator) phaseIntake(ctx context.Context, r *run) (any, error) {
 func (o *Orchestrator) phaseInvestigate(ctx context.Context, r *run) (any, error) {
 	budget, err := remainingBudget(o.opts.Budget, r.priorByPhase[PhaseInvestigate])
 	if err != nil {
+		// The hound never ran, so this attempt cost the case nothing: the
+		// checkpoint must keep recording the spend of the attempts that did
+		// run, and no more.
+		r.phaseRefused = true
 		return nil, err
 	}
 	finding, spend, err := o.opts.Investigate(ctx, r.c, budget)
