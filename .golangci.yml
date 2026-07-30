@@ -18,7 +18,9 @@ linters:
     # the other half of that rule: formatting or comparing errors in ways that
     # silently break under wrapping.
     - errorlint
-    # "no panics outside main."
+    # "no panics outside main." cmd/ has no panics today; if main ever needs
+    # one, it takes a site-local `//nolint:forbidigo // <why>` rather than a
+    # blanket exemption for the whole tree.
     - forbidigo
     # Every response body from the Prometheus HTTP API must be closed.
     - bodyclose
@@ -48,27 +50,28 @@ linters:
     presets:
       - comments
       - std-error-handling
+    # Anchored path rules (`^cmd/`, `^internal/promtest/`) used to live here.
+    # They silently stopped applying whenever golangci-lint reported a finding
+    # under a `../`-prefixed path — which the shared, import-path-keyed cache
+    # makes routine across sibling git worktrees (issue #25). An exclusion that
+    # fails open is worse than no exclusion: the run goes red on code the
+    # branch never touched, and it looks like a real finding.
+    #
+    # Everything that used to be excluded by an anchored path now carries a
+    # site-local `//nolint:<linter> // reason` comment instead. Those are
+    # resolved from the file itself, so they hold no matter what prefix the
+    # reported path has, and each one states why at the line it applies to.
+    # New exclusions belong at the site, not here.
     rules:
       # Tests panic freely and assert on concrete errors; the rules above are
-      # about production code paths.
+      # about production code paths. Deliberately NOT anchored with `^`: the
+      # pattern is a substring match on the suffix `_test.go`, so it keeps
+      # matching under a `../other-worktree/` prefix and cannot fail open.
       - path: _test\.go
         linters:
           - forbidigo
           - errcheck
           - bodyclose
-          - noctx
-      # main is where panics and os.Exit legitimately live.
-      - path: ^cmd/
-        linters:
-          - forbidigo
-      # promtest is test scaffolding that drives the docker CLI and reserves a
-      # loopback port. Its teardown path deliberately ignores errors and
-      # deliberately does not thread the (already-failed) context into
-      # container cleanup — stopping the container has to happen either way.
-      - path: ^internal/promtest/
-        linters:
-          - contextcheck
-          - errcheck
           - noctx
 
 # Report everything. The defaults cap output at 3 issues of a kind and 50 per
