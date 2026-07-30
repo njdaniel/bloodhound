@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/njdaniel/bloodhound/internal/seqname"
 )
 
 // clientName and clientVersion identify bloodhound to MCP servers during
@@ -127,7 +129,7 @@ func Connect(ctx context.Context, cfg Config) (*Session, error) {
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		return nil, fmt.Errorf("creating capture dir: %w", err)
 	}
-	seq, err := nextSeq(sub)
+	seq, err := seqname.Next(sub)
 	if err != nil {
 		return nil, fmt.Errorf("scanning capture dir: %w", err)
 	}
