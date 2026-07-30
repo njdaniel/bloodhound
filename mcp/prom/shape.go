@@ -199,13 +199,25 @@ func rankSeries(rs []rankedSeries) {
 //	n=9   0,2,4,6,8            → 5 points   (old: 0,1,3,5,7,8)
 //	n=33  0,2,4,…,30,32        → 17 points  (old: 0,1,3,…,31,32)
 //
-// For odd n every kept index is even and the survivors are an evenly spaced
-// grid; the count stays odd, so every later pass is evenly spaced too — a
-// 33-point series decimates to a uniform 17, 9, 5, 3, 2. For even n the grid
-// is uniform except for a single short gap at the end, forced by pinning the
-// last sample. The old stride instead put its irregular gap immediately after
-// the first sample and doubled up at both ends (n=9 kept 0,1 and 7,8), which
-// oversampled the edges of the window at the expense of the middle.
+// One pass on an odd n keeps only even indices, so the survivors are an evenly
+// spaced grid. Whether the whole chain stays uniform is a narrower claim: an
+// odd n = 2k+1 retains k+1 points, which is odd again only when n ≡ 1 (mod 4),
+// so the uniform 33 → 17 → 9 → 5 → 3 → 2 above is the n = 2^j+1 family, not
+// odd n in general — n=7 goes 0,2,4,6 (uniform) then 0,4,6, and n=11 reaches
+// gaps of 8,2 by its third pass. The canonical input is in that second case,
+// since MaxPointsPerSeries and effectiveStep clamp a full-window query to 121
+// points:
+//
+//	121 → 61 → 31 → 16 → 9 → 5 → 3 → 2
+//	gaps:  2…   4…   8…   16×7,8   32×3,24   64,56   120
+//
+// So the grid is exactly uniform for the first three passes and then carries
+// one odd gap. That gap is bounded and lands where it hurts least: it is
+// always the final one and always shorter than the rest, so the newest samples
+// are never thinned harder than the window average — which for incident work
+// is the end you want intact. The old stride put its irregular gaps at both
+// ends (n=9 kept 0,1 and 7,8), spending extra points on the start of the
+// window, and on n=3 it kept everything.
 //
 // First and last are appended unconditionally and the loop's bound (i < n−1)
 // keeps it from re-adding the last, so the endpoints survive every pass at
