@@ -515,6 +515,14 @@ func (s *toolServer) handleSeriesMetadata(ctx context.Context, _ *mcp.CallToolRe
 	// — and blaming those on the series limit hands the model a fabricated
 	// cause and useless advice. They are passed through verbatim instead,
 	// which is something it can actually act on.
+	//
+	// The verbatim branch is covered by unit tests against the fake only. A
+	// stock Prometheus (v3.5.0, measured) never reaches it: the truncation
+	// warning is the sole warning its /api/v1/series emits, and a failing
+	// remote_read — the one other warning source a single-binary test can set
+	// up — surfaces on /api/v1/query but not on /api/v1/series. Reaching it
+	// for real needs a backend this repo's integration suite does not run
+	// (issue #27).
 	var seriesCapped bool
 	var otherWarnings []string
 	for _, w := range warnings {

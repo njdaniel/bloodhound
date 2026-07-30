@@ -227,3 +227,10 @@ mean "not fetched" rather than "not registered".
   which is what keeps it to seconds; `make lint` does still analyse them, since
   `.golangci.yml` sets `build-tags: [integration]`. Without docker they skip
   rather than fail.
+- One integration test scrapes a fixture registering three times the larger of
+  `MaxUpstreamSeries` and `MaxUpstreamMetadata` metric names, so both upstream
+  limits actually fire and the wording of the real truncation warning is
+  asserted rather than assumed.
+- The verbatim pass-through of a *non-truncation* warning is unit-test-only:
+  Prometheus v3.5.0 emits no such warning on `/api/v1/series`, so provoking it
+  needs a backend (Thanos, Cortex) this suite does not run.
