@@ -179,6 +179,37 @@ func rankSeries(rs []rankedSeries) {
 // thinPoints drops every second interior point, always keeping the first and
 // last samples (spec 002 §2.3 step 6). Series with two or fewer points are
 // returned unchanged. The second return reports whether anything was dropped.
+//
+// The interior stride starts at index 2, and that detail is load-bearing twice
+// over.
+//
+// It is what makes the rule converge. Output length is floor((n−2)/2)+2,
+// strictly less than n for every n ≥ 3, so repeated application walks
+// 33 → 17 → 9 → 5 → 3 → 2 and halts on the two-point floor the spec describes.
+// A stride starting at index 1 keeps index 1, so a 3-point series thins to
+// itself and reports no change: a fixed point one point above the floor, which
+// stalled the query_range size backstop while a fitting payload was still
+// reachable (issue #33).
+//
+// It also samples better than the stride it replaced. Retained indices:
+//
+//	n=3   0,2                  → 2 points   (old: 0,1,2 — no change)
+//	n=5   0,2,4                → 3 points   (old: 0,1,3,4)
+//	n=8   0,2,4,6,7            → 5 points   (old: 0,1,3,5,7)
+//	n=9   0,2,4,6,8            → 5 points   (old: 0,1,3,5,7,8)
+//	n=33  0,2,4,…,30,32        → 17 points  (old: 0,1,3,…,31,32)
+//
+// For odd n every kept index is even and the survivors are an evenly spaced
+// grid; the count stays odd, so every later pass is evenly spaced too — a
+// 33-point series decimates to a uniform 17, 9, 5, 3, 2. For even n the grid
+// is uniform except for a single short gap at the end, forced by pinning the
+// last sample. The old stride instead put its irregular gap immediately after
+// the first sample and doubled up at both ends (n=9 kept 0,1 and 7,8), which
+// oversampled the edges of the window at the expense of the middle.
+//
+// First and last are appended unconditionally and the loop's bound (i < n−1)
+// keeps it from re-adding the last, so the endpoints survive every pass at
+// every n — the property the model is told about in the truncation note.
 func thinPoints(pts []point) ([]point, bool) {
 	n := len(pts)
 	if n <= 2 {
@@ -186,7 +217,7 @@ func thinPoints(pts []point) ([]point, bool) {
 	}
 	out := make([]point, 0, n/2+2)
 	out = append(out, pts[0])
-	for i := 1; i < n-1; i += 2 {
+	for i := 2; i < n-1; i += 2 {
 		out = append(out, pts[i])
 	}
 	out = append(out, pts[n-1])
