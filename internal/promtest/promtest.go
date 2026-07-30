@@ -427,3 +427,93 @@ func (w *Workload) Scrapes() int64 { return w.restarts.Load() }
 
 // Close shuts the metrics endpoint down.
 func (w *Workload) Close() { w.srv.Close() }
+
+// Bulk fixture identifiers. The bulk target exists only to push a real
+// Prometheus past the upstream caps series_metadata sends to /api/v1/series
+// and /api/v1/metadata, which the S01-shaped Workload above is far too small
+// to do.
+const (
+	// BulkJobName is the scrape job label for a BulkWorkload target. It is
+	// distinct from JobName so a bulk target and an S01 target can share a
+	// server without a selector matching both.
+	BulkJobName = "bloodhound-bulk"
+
+	// BulkMetricPrefix starts every BulkWorkload metric name, so a test can
+	// tell a fixture metric from one Prometheus synthesises for itself (up,
+	// scrape_duration_seconds, …) without hard-coding a full name.
+	BulkMetricPrefix = "bloodhound_bulk_"
+
+	// BulkHelpPrefix starts every BulkWorkload HELP string.
+	BulkHelpPrefix = "Synthetic bulk fixture metric"
+
+	// BulkMetricType is the TYPE every BulkWorkload metric declares.
+	BulkMetricType = "counter"
+
+	// BulkShardLabel and BulkShardValue are the one label every BulkWorkload
+	// series carries, so a test can check the label plumbing survived.
+	BulkShardLabel = "shard"
+	BulkShardValue = "a"
+)
+
+// BulkMetricName returns the name of the i-th BulkWorkload metric, counting
+// from zero. The index is zero-padded so lexicographic order matches numeric
+// order.
+func BulkMetricName(i int) string { return fmt.Sprintf("%s%06d_total", BulkMetricPrefix, i) }
+
+// BulkWorkload is an httptest server exposing a large number of distinct
+// metric names, one series each. It exists so an integration test can make
+// Prometheus's own /api/v1/series and /api/v1/metadata limits fire for real:
+// the fake in mcp/prom can emit a truncation warning on demand, but only a
+// real server decides when to truncate, in what order, and whether it says so.
+//
+// Every metric carries both HELP and TYPE. That is load-bearing: it means any
+// metric that comes back from /api/v1/metadata without type or help was
+// dropped by the metadata limit rather than never registered.
+type BulkWorkload struct {
+	srv   *httptest.Server
+	body  []byte
+	count int
+}
+
+// StartBulkWorkload starts a metrics endpoint exposing count distinct metric
+// names on 127.0.0.1. The exposition is constant, so repeated scrapes add
+// samples but no new series.
+func StartBulkWorkload(count int) *BulkWorkload {
+	w := &BulkWorkload{count: count, body: bulkExposition(count)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		rw.Write(w.body) //nolint:errcheck // a failed write to a test scrape shows up as a missing series
+	})
+	w.srv = httptest.NewServer(mux)
+	return w
+}
+
+// bulkExposition renders count metrics in the Prometheus text format, built
+// once at startup because it never changes and can run to megabytes.
+func bulkExposition(count int) []byte {
+	var b strings.Builder
+	b.Grow(count * 160)
+	for i := range count {
+		name := BulkMetricName(i)
+		fmt.Fprintf(&b, "# HELP %s %s %d.\n", name, BulkHelpPrefix, i)
+		fmt.Fprintf(&b, "# TYPE %s %s\n", name, BulkMetricType)
+		fmt.Fprintf(&b, "%s{%s=%q} %d\n", name, BulkShardLabel, BulkShardValue, i)
+	}
+	return []byte(b.String())
+}
+
+// Count reports how many distinct metric names the endpoint exposes, which is
+// also its series count.
+func (w *BulkWorkload) Count() int { return w.count }
+
+// HostPort returns the host:port Prometheus should scrape.
+func (w *BulkWorkload) HostPort() string {
+	return strings.TrimPrefix(w.srv.URL, "http://")
+}
+
+// URL returns the workload's base URL.
+func (w *BulkWorkload) URL() string { return w.srv.URL }
+
+// Close shuts the metrics endpoint down.
+func (w *BulkWorkload) Close() { w.srv.Close() }
