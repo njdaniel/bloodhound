@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -39,6 +40,17 @@ func formatValue(v float64) string {
 	return fmt.Sprintf(FloatFormat, v)
 }
 
+// byteSize renders a byte count for model-facing text: exact KiB when the
+// count divides evenly, plain bytes otherwise. Integer division alone would
+// round a 40000-byte cap down to "39 KiB" and hand the model a number that is
+// not the limit it is being told about.
+func byteSize(n int) string {
+	if n%1024 == 0 {
+		return fmt.Sprintf("%d KiB", n/1024)
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
 // seriesStats summarizes one series so the model can reason about it without
 // reading every point. Always computed from full-resolution data, before any
 // point-thinning. NaN samples are ignored; a series of only NaN samples
@@ -52,6 +64,14 @@ type seriesStats struct {
 
 // computeStats derives seriesStats plus the ranking inputs — value range
 // (max−min) and max |value| — from full-resolution samples.
+//
+// Neither ranking input is ever NaN, which is what lets rankSeries be a total
+// order: a NaN compares unequal to itself, so it would send the comparator
+// down a branch that returns false in both directions and never reaches the
+// labelset tie-break. Samples that are NaN are skipped, and the one remaining
+// source — an all-+Inf or all-−Inf series, which PromQL produces readily from
+// a division by zero and whose range is Inf−Inf — is normalised to −1 so it
+// sorts last. handleQueryInstant normalises its own NaN |value| the same way.
 func computeStats(values []promPoint) (stats seriesStats, valueRange, maxAbs float64) {
 	var (
 		minV, maxV, last float64
@@ -78,16 +98,29 @@ func computeStats(values []promPoint) (stats seriesStats, valueRange, maxAbs flo
 	if n == 0 {
 		return seriesStats{}, 0, 0
 	}
+	valueRange = maxV - minV
+	if math.IsNaN(valueRange) { // all +Inf or all −Inf; rank it last
+		valueRange = -1
+	}
 	return seriesStats{
 		Min:  jsonFloat(minV),
 		Max:  jsonFloat(maxV),
 		Avg:  jsonFloat(sum / float64(n)),
 		Last: jsonFloat(last),
-	}, maxV - minV, maxAbs
+	}, valueRange, maxAbs
 }
 
 // labelsetKey renders labels in canonical sorted-key order; it is the final,
-// fully deterministic tie-break for every ranking in this server.
+// fully deterministic tie-break for every ranking in this server. It is never
+// serialized — only compared.
+//
+// Names and values are quoted rather than concatenated raw, because raw
+// concatenation is not injective: {a: "b,c=d"} and {a: "b", c: "d"} both
+// render as `a=b,c=d`. Two distinct series sharing a key make the tie-break a
+// no-op, and the ranking then falls back to whatever order Prometheus
+// happened to return — which is exactly the nondeterminism this key exists to
+// remove. Quoting escapes the separators (and any embedded quote), so the
+// rendering is reversible: distinct label sets always produce distinct keys.
 func labelsetKey(labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
@@ -99,9 +132,9 @@ func labelsetKey(labels map[string]string) string {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		b.WriteString(k)
+		b.WriteString(strconv.Quote(k))
 		b.WriteByte('=')
-		b.WriteString(labels[k])
+		b.WriteString(strconv.Quote(labels[k]))
 	}
 	return b.String()
 }
@@ -116,7 +149,21 @@ type rankedSeries struct {
 
 // rankSeries sorts series per spec 002 §2.3 step 4: (max−min) descending,
 // then max |value| descending, then lexicographically by sorted labelset.
-// Labelsets are unique within a Prometheus result, so the order is total.
+//
+// The comparison is a total order — so an unstable sort has exactly one
+// answer to reach, whatever order the input arrived in — but only because of
+// two preconditions its callers must keep:
+//
+//   - Distinct series produce distinct keys. Labelsets are unique within a
+//     Prometheus result, and labelsetKey maps distinct labelsets to distinct
+//     keys.
+//   - Neither valueRange nor maxAbs is NaN. A NaN compares unequal to itself,
+//     so the first two branches would both be entered and both return false,
+//     ending the comparison before the key is ever read. computeStats
+//     guarantees this.
+//
+// Break either one and the ranking silently degrades to whatever order
+// Prometheus returned.
 func rankSeries(rs []rankedSeries) {
 	sort.Slice(rs, func(i, j int) bool {
 		if rs[i].valueRange != rs[j].valueRange {
@@ -147,8 +194,15 @@ func thinPoints(pts []point) ([]point, bool) {
 }
 
 // joinNotes assembles a truncation note from its parts, skipping empties.
+//
+// It copies rather than compacting parts in place. That is defensive, not a
+// bug fix: every note any caller appends today is a non-empty Sprintf, so an
+// in-place compaction is currently the identity. But query_range calls this
+// on a slice it keeps appending to across size-backstop passes, and the day
+// an empty part reaches it, compaction would quietly rewrite that slice
+// between passes.
 func joinNotes(parts ...string) string {
-	kept := parts[:0]
+	kept := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if p != "" {
 			kept = append(kept, p)

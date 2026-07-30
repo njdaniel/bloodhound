@@ -277,6 +277,142 @@ func TestQueryRangeSizeBackstop(t *testing.T) {
 	}
 }
 
+// TestQueryRangeCollidingLabelsetsRankDeterministically feeds two series that
+// tie on every ranking key and whose label sets render identically under naive
+// concatenation ({a: "b,c=d"} vs {a: "b", c: "d"}). If the labelset tie-break
+// cannot tell them apart, the sort keeps whatever order Prometheus returned,
+// so the same result set serialized in two upstream orders yields two
+// different payloads.
+func TestQueryRangeCollidingLabelsetsRankDeterministically(t *testing.T) {
+	// Identical value range (5) and max |value| (5): the labelset key is the
+	// only thing left to order them by.
+	merged := seriesFixture(map[string]string{"a": "b,c=d"},
+		[][2]any{{1753700000, "0"}, {1753700030, "5"}})
+	split := seriesFixture(map[string]string{"a": "b", "c": "d"},
+		[][2]any{{1753700000, "0"}, {1753700030, "5"}})
+
+	first := queryRangePayload(t, []map[string]any{merged, split})
+	second := queryRangePayload(t, []map[string]any{split, merged})
+	if first != second {
+		t.Errorf("upstream order changed the payload; the labelset tie-break is not total:\n a,b: %s\n b,a: %s", first, second)
+	}
+}
+
+// queryRangePayload serves upstream as the query_range result and returns the
+// serialized tool payload, for tests that compare two upstream orderings.
+func queryRangePayload(t *testing.T, upstream []map[string]any) string {
+	t.Helper()
+	fake := newFakeProm(t)
+	fake.set("/api/v1/query_range", 200, matrixJSON(t, upstream))
+	res, _, err := newTestToolServer(fake).handleQueryRange(context.Background(), nil, queryRangeInput{
+		Query: "up", Start: "2026-07-28T10:00:00Z", End: "2026-07-28T10:01:00Z",
+	})
+	if err != nil {
+		t.Fatalf("handleQueryRange: %v", err)
+	}
+	return resultText(t, res)
+}
+
+// TestQueryRangeAllInfiniteSeriesRankDeterministically covers the other way
+// the ranking can lose totality: an all-+Inf series (PromQL `foo / 0` makes
+// them readily) has valueRange = Inf−Inf = NaN. NaN != NaN is true, so the
+// comparator enters its first branch and returns NaN > NaN — false in both
+// directions — without ever reaching the labelset tie-break, and an unstable
+// sort then leaves Prometheus's order as the arbiter.
+func TestQueryRangeAllInfiniteSeriesRankDeterministically(t *testing.T) {
+	series := func(pod string) map[string]any {
+		return seriesFixture(map[string]string{"pod": pod},
+			[][2]any{{1753700000, "+Inf"}, {1753700030, "+Inf"}})
+	}
+	aaa, bbb, ccc := series("aaa"), series("bbb"), series("ccc")
+
+	first := queryRangePayload(t, []map[string]any{aaa, bbb, ccc})
+	second := queryRangePayload(t, []map[string]any{ccc, bbb, aaa})
+	if first != second {
+		t.Errorf("upstream order changed the payload; a NaN value range escapes the tie-break:\n asc:  %s\n desc: %s", first, second)
+	}
+	// Sorting last is the specific normalisation: a degenerate series must
+	// not outrank a real one, even one whose labels sort after it.
+	mixed := queryRangePayload(t, []map[string]any{aaa,
+		seriesFixture(map[string]string{"pod": "zzz-real"}, [][2]any{{1753700000, "0"}, {1753700030, "1"}})})
+	// An all-Inf series serializes its stats as the quoted string "+Inf",
+	// which will not decode into gotRange's float64 fields; compare
+	// positions in the payload instead.
+	ranked, degenerate := strings.Index(mixed, `"zzz-real"`), strings.Index(mixed, `"aaa"`)
+	if ranked < 0 || degenerate < 0 || ranked > degenerate {
+		t.Errorf("all-Inf series did not rank last: zzz-real at index %d, aaa at %d, in %s", ranked, degenerate, mixed)
+	}
+}
+
+// TestQueryRangeMarksOversizedPayloadAfterThinning covers the size backstop's
+// dead end: series whose label sets alone blow the 32 KiB cap, so thinning
+// reaches a fixed point before the payload fits. The result ships oversized
+// and spec 002 §2.1 requires it to say so rather than pass for a complete
+// result.
+func TestQueryRangeMarksOversizedPayloadAfterThinning(t *testing.T) {
+	// 15 series x 30 labels x 120-byte values is well over 32 KiB with only
+	// two points each, so no amount of thinning helps.
+	fixture := func(nPoints int) string {
+		var series []map[string]any
+		for i := 0; i < MaxSeries; i++ {
+			labels := map[string]string{"pod": fmt.Sprintf("checkout-%02d", i)}
+			for k := 0; k < 30; k++ {
+				labels[fmt.Sprintf("label_%02d", k)] = strings.Repeat("v", MaxStringLen)
+			}
+			values := make([][2]any, 0, nPoints)
+			for p := 0; p < nPoints; p++ {
+				values = append(values, [2]any{1753700000 + p*30, fmt.Sprintf("%d", i+p)})
+			}
+			series = append(series, seriesFixture(labels, values))
+		}
+		return matrixJSON(t, series)
+	}
+	tests := []struct {
+		name        string
+		nPoints     int
+		wantThinned bool
+	}{
+		// Already at the two-point floor: the very first backstop pass has
+		// nothing to thin and must still mark the overflow.
+		{"nothing left to thin", 2, false},
+		// Thins over several passes until thinPoints reaches its fixed
+		// point, then gives up: both the thinning and the overflow have to
+		// be recorded.
+		{"thinned to a fixed point and still too big", 33, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeProm(t)
+			fake.set("/api/v1/query_range", 200, fixture(tc.nPoints))
+			res, _, err := newTestToolServer(fake).handleQueryRange(context.Background(), nil, queryRangeInput{
+				Query: "up", Start: "2026-07-28T10:00:00Z", End: "2026-07-28T11:00:00Z",
+			})
+			if err != nil {
+				t.Fatalf("handleQueryRange: %v", err)
+			}
+			payload := resultText(t, res)
+			if len(payload) <= MaxResponseBytes {
+				t.Fatalf("fixture serialized to %d bytes; it must exceed the %d-byte cap to reach the dead end", len(payload), MaxResponseBytes)
+			}
+			g := decodeRange(t, res)
+			if g.Truncation.PointsThinned != tc.wantThinned {
+				t.Errorf("points_thinned = %v, want %v", g.Truncation.PointsThinned, tc.wantThinned)
+			}
+			if !strings.Contains(g.Truncation.Note, "exceeds") || !strings.Contains(g.Truncation.Note, "32 KiB") {
+				t.Errorf("truncation note %q does not record that the response cap was exceeded", g.Truncation.Note)
+			}
+			if tc.wantThinned && !strings.Contains(g.Truncation.Note, "Points thinned") {
+				t.Errorf("truncation note %q dropped the thinning sentence it had already earned", g.Truncation.Note)
+			}
+			for i, s := range g.Series {
+				if len(s.Points) >= tc.nPoints && tc.wantThinned {
+					t.Fatalf("series %d kept %d of %d points; the backstop stopped short", i, len(s.Points), tc.nPoints)
+				}
+			}
+		})
+	}
+}
+
 func TestQueryRangeRangeLimitError(t *testing.T) {
 	ts := newTestToolServer(newFakeProm(t))
 	_, _, err := ts.handleQueryRange(context.Background(), nil, queryRangeInput{

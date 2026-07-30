@@ -617,6 +617,52 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
+// TestByteSize pins that a cap quoted to the model is the cap that applies.
+// Integer division alone floors, so a non-multiple of 1024 would be described
+// as a smaller limit than the one actually enforced.
+func TestByteSize(t *testing.T) {
+	tests := []struct {
+		in   int
+		want string
+	}{
+		{MaxResponseBytes, "32 KiB"},
+		{1024, "1 KiB"},
+		{40000, "40000 bytes"},
+		{1023, "1023 bytes"},
+		{0, "0 KiB"},
+	}
+	for _, tc := range tests {
+		if got := byteSize(tc.in); got != tc.want {
+			t.Errorf("byteSize(%d) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestLabelsetKeyIsUnambiguous pins the one property the final ranking
+// tie-break depends on: distinct label sets must never share a key. Raw
+// concatenation collides whenever a value contains the separators, which
+// silently turns the tie-break into a no-op.
+func TestLabelsetKeyIsUnambiguous(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b map[string]string
+	}{
+		{"separators inside a value", map[string]string{"a": "b,c=d"}, map[string]string{"a": "b", "c": "d"}},
+		{"equals inside a value", map[string]string{"a": "b=c"}, map[string]string{"a=b": "c"}},
+		{"trailing empty value", map[string]string{"a": "b,c="}, map[string]string{"a": "b", "c": ""}},
+		// Guards the fix itself: a quoted key must escape embedded quotes,
+		// or the collision simply moves to values that contain one.
+		{"quotes inside a value", map[string]string{"a": `b","c`, "d": "e"}, map[string]string{"a": "b", "c": "", "d": "e"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if ka, kb := labelsetKey(tc.a), labelsetKey(tc.b); ka == kb {
+				t.Errorf("labelsetKey(%v) == labelsetKey(%v) == %q; distinct label sets must not collide", tc.a, tc.b, ka)
+			}
+		})
+	}
+}
+
 func TestThinPointsKeepsFirstAndLast(t *testing.T) {
 	pts := []point{{0, "a"}, {1, "b"}, {2, "c"}, {3, "d"}, {4, "e"}}
 	got, changed := thinPoints(pts)
