@@ -78,7 +78,10 @@ serialized results byte-exact):
 6. **Size backstop.** Serialized result over 32 KiB → thin points: keep first
    and last, drop every second interior point, repeat until it fits. Sets
    `points_thinned: true`. Per-series `stats` are always computed from the
-   **full-resolution** data, before thinning.
+   **full-resolution** data, before thinning. Thinning bottoms out at two
+   points per series — first and last; a result still over the cap there
+   (labels and series count, which this step cannot thin) is returned
+   oversized and says so in `truncation.note`.
 
 ## Tool surface
 
