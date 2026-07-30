@@ -663,20 +663,100 @@ func TestLabelsetKeyIsUnambiguous(t *testing.T) {
 	}
 }
 
-func TestThinPointsKeepsFirstAndLast(t *testing.T) {
-	pts := []point{{0, "a"}, {1, "b"}, {2, "c"}, {3, "d"}, {4, "e"}}
-	got, changed := thinPoints(pts)
-	if !changed {
-		t.Fatal("thinPoints reported no change")
+// ramp builds n points whose timestamps are their indices, so a thinned
+// result reads back as the list of retained indices.
+func ramp(n int) []point {
+	pts := make([]point, 0, n)
+	for i := 0; i < n; i++ {
+		pts = append(pts, point{ts: int64(i), val: strconv.Itoa(i)})
 	}
-	if got[0].ts != 0 || got[len(got)-1].ts != 4 {
-		t.Errorf("first/last = %d/%d, want 0/4", got[0].ts, got[len(got)-1].ts)
+	return pts
+}
+
+// retained lists the timestamps of pts, i.e. the original indices under ramp.
+func retained(pts []point) []int64 {
+	out := make([]int64, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, p.ts)
 	}
-	if len(got) != 4 { // p0, p1, p3, p4
-		t.Errorf("got %d points, want 4", len(got))
+	return out
+}
+
+// TestThinPointsRetainedPattern pins exactly which samples survive one pass,
+// for the representative sizes documented on thinPoints. It is the sampling
+// half of the contract: the stride change of issue #33 moved every retained
+// index, not just the ones on oversized results, so the pattern is worth
+// asserting rather than inferring from a length.
+func TestThinPointsRetainedPattern(t *testing.T) {
+	evens := func(n int) []int64 {
+		var out []int64
+		for i := 0; i < n; i += 2 {
+			out = append(out, int64(i))
+		}
+		return out
 	}
-	short := []point{{0, "a"}, {1, "b"}}
-	if _, changed := thinPoints(short); changed {
-		t.Error("thinPoints changed a 2-point series")
+	tests := []struct {
+		n           int
+		want        []int64
+		wantChanged bool
+	}{
+		{0, nil, false},
+		{1, []int64{0}, false},
+		{2, []int64{0, 1}, false},
+		// The case the fixed point used to swallow: three points must reach
+		// the two-point floor the spec's keep-first-and-last rule describes.
+		{3, []int64{0, 2}, true},
+		{4, []int64{0, 2, 3}, true},
+		{5, []int64{0, 2, 4}, true},
+		// Even n: uniform except for the short final gap forced by pinning
+		// the last sample.
+		{8, []int64{0, 2, 4, 6, 7}, true},
+		// Odd n: an evenly spaced grid, and the count stays odd, so every
+		// later pass is evenly spaced too.
+		{9, []int64{0, 2, 4, 6, 8}, true},
+		{33, evens(33), true},
+	}
+	for _, tc := range tests {
+		t.Run(strconv.Itoa(tc.n), func(t *testing.T) {
+			got, changed := thinPoints(ramp(tc.n))
+			if changed != tc.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if fmt.Sprint(retained(got)) != fmt.Sprint(tc.want) {
+				t.Errorf("retained indices = %v, want %v", retained(got), tc.want)
+			}
+		})
+	}
+}
+
+// TestThinPointsConvergesToTwoPoints is the termination half: every series
+// above the floor must shrink on every pass and land on exactly two points,
+// with the endpoints intact. Before issue #33 the stride started at index 1,
+// which kept index 1 of a 3-point series and stalled there — one point above
+// the floor, and enough to make the query_range size backstop give up while a
+// fitting payload was still reachable.
+func TestThinPointsConvergesToTwoPoints(t *testing.T) {
+	for n := 3; n <= 2*MaxPointsPerSeries; n++ {
+		pts := ramp(n)
+		last := len(pts)
+		for passes := 0; ; passes++ {
+			if passes > n {
+				t.Fatalf("n=%d: still thinning after %d passes, at %d points", n, passes, len(pts))
+			}
+			next, changed := thinPoints(pts)
+			if !changed {
+				break
+			}
+			if len(next) >= last {
+				t.Fatalf("n=%d: pass %d went from %d to %d points; thinning must shrink", n, passes, last, len(next))
+			}
+			pts, last = next, len(next)
+		}
+		if len(pts) != 2 {
+			t.Errorf("n=%d converged at %d points, want the two-point floor", n, len(pts))
+		}
+		if pts[0].ts != 0 || pts[len(pts)-1].ts != int64(n-1) {
+			t.Errorf("n=%d: first/last = %d/%d, want 0/%d", n, pts[0].ts, pts[len(pts)-1].ts, n-1)
+		}
 	}
 }
