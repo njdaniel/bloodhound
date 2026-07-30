@@ -3,6 +3,16 @@
 # Keep in sync with .github/workflows/ci.yml's lint job.
 GOLANGCI_VERSION := 2.12.2
 
+# golangci-lint's cache is keyed by import path, not by directory, so the
+# default shared cache under ~/.cache serves one worktree's results to
+# another — every agent worktree under .claude/worktrees/ has the same import
+# paths (issue #25). Keeping the cache inside the checkout gives each worktree
+# its own, so a run only ever reports files it can actually see. `?=` so
+# `GOLANGCI_LINT_CACHE=... make lint` still wins, and CI (fresh checkout, cold
+# cache) is unaffected either way.
+GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
+export GOLANGCI_LINT_CACHE
+
 build:
 	go build ./...
 
@@ -45,4 +55,4 @@ check: fmt vet build test lint
 	@echo "ok"
 
 clean:
-	rm -rf bin/
+	rm -rf bin/ .golangci-cache/

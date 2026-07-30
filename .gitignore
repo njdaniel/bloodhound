@@ -1,6 +1,9 @@
 bin/
 *.exe
 
+# Per-worktree golangci-lint cache (see the Makefile's lint target).
+.golangci-cache/
+
 # Agent worktrees live here; .claude/commands/ is tracked, this is not.
 .claude/worktrees/
 .env
