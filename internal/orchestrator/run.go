@@ -286,6 +286,14 @@ type run struct {
 	// phaseSpend is set by a phase to report what it consumed, and consumed
 	// by runPhase when it writes the checkpoint.
 	phaseSpend Spend
+	// phaseRefused is set by a phase that declined to run at all — today only
+	// the investigate budget check. The attempt did no work, so runPhase
+	// records no wall clock for it: otherwise every futile resume against an
+	// exhausted budget would add its own measured wall to the checkpoint, and
+	// the ledger `bloodhound cost` reads would climb for a phase that never
+	// ran. A phase that ran and then failed is not refused — its spend is real
+	// and is still charged (spec 002 §4.3).
+	phaseRefused bool
 
 	// finding and artifacts carry phase outputs between phases.
 	finding   Finding
@@ -404,11 +412,14 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	defer cancel()
 
 	r.phaseSpend = Spend{}
+	r.phaseRefused = false
 	out, phaseErr := fn(pctx, r)
 	finished := o.now()
 
 	spend := r.phaseSpend
-	spend.WallMS = finished.Sub(started).Milliseconds()
+	if !r.phaseRefused {
+		spend.WallMS = finished.Sub(started).Milliseconds()
+	}
 	r.prior = r.prior.Add(spend)
 	r.priorByPhase[phase] = r.priorByPhase[phase].Add(spend)
 
@@ -520,6 +531,10 @@ func (o *Orchestrator) phaseIntake(ctx context.Context, r *run) (any, error) {
 func (o *Orchestrator) phaseInvestigate(ctx context.Context, r *run) (any, error) {
 	budget, err := remainingBudget(o.opts.Budget, r.priorByPhase[PhaseInvestigate])
 	if err != nil {
+		// The hound never ran, so this attempt cost the case nothing: the
+		// checkpoint must keep recording the spend of the attempts that did
+		// run, and no more.
+		r.phaseRefused = true
 		return nil, err
 	}
 	finding, spend, err := o.opts.Investigate(ctx, r.c, budget)
