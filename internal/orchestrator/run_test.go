@@ -1132,9 +1132,93 @@ func TestPhaseTimeoutsFollowTheSpec(t *testing.T) {
 		PhaseReport:      ReportTimeout,
 	}
 	for phase, want := range tests {
-		if got := o.phaseTimeout(phase); got != want {
+		if got := o.phaseTimeout(phase, Spend{}); got != want {
 			t.Errorf("%s timeout = %s, want %s", phase, got, want)
 		}
+	}
+}
+
+// TestInvestigatePhaseTimeoutUsesRemainingBudget is the second half of issue
+// #32: the deadline must mean what it says. A resume with four seconds of
+// wall-clock budget left may not be handed the deadline a fresh case gets.
+func TestInvestigatePhaseTimeoutUsesRemainingBudget(t *testing.T) {
+	h := &fakeHound{}
+	o, err := New(Options{Root: "work", Investigate: h.run, Report: fixedReport,
+		Budget: Budget{MaxWallClock: 2 * time.Minute}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	tests := []struct {
+		name  string
+		spent Spend
+		want  time.Duration
+	}{
+		{name: "fresh case", spent: Spend{}, want: 2*time.Minute + InvestigateGrace},
+		{name: "half spent", spent: Spend{WallMS: 60_000}, want: time.Minute + InvestigateGrace},
+		{name: "four seconds left", spent: Spend{WallMS: 116_000}, want: 4*time.Second + InvestigateGrace},
+		// An overspent phase is refused by the budget check; the deadline is
+		// clamped so the refusal is not reported as a timeout.
+		{name: "overspent", spent: Spend{WallMS: 200_000}, want: InvestigateGrace},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := o.phaseTimeout(PhaseInvestigate, tt.spent); got != tt.want {
+				t.Errorf("investigate timeout = %s, want %s", got, tt.want)
+			}
+		})
+	}
+
+	// A disabled cap has no remainder to compute and keeps the default
+	// backstop, whatever the phase has already spent.
+	disabled, err := New(Options{Root: "work", Investigate: h.run, Report: fixedReport,
+		Budget: Budget{MaxWallClock: -1}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := disabled.phaseTimeout(PhaseInvestigate, Spend{WallMS: 999_000}); got != DefaultMaxWallClock+InvestigateGrace {
+		t.Errorf("disabled-cap timeout = %s, want %s", got, DefaultMaxWallClock+InvestigateGrace)
+	}
+}
+
+// TestResumedInvestigateDeadlineReflectsRemainingBudget is the same property
+// observed from inside the phase: the context the hound actually runs under
+// carries the shortened deadline, not just the number phaseTimeout computes.
+func TestResumedInvestigateDeadlineReflectsRemainingBudget(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 60 * time.Second}
+
+	// A first attempt that burns 56s of the 60s cap and fails.
+	first := &fakeHound{err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, first, func(o *Options) {
+		o.Budget = budget
+		o.Now = phaseClock(0, time.Second, 0, 56*time.Second)
+	}).Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	wantWallMS(t, readCheckpoints(t, filepath.Join(root, caseID)), PhaseInvestigate, 56*time.Second)
+
+	// The resumed attempt has 4s of budget left, so its deadline is 4s plus the
+	// grace window — not the 90s a fresh case would get. The deadline comes off
+	// the real clock, so this is a bound rather than an equality.
+	var left time.Duration
+	second := &fakeHound{finding: cannedFinding()}
+	o := newTest(t, root, second, func(opts *Options) {
+		opts.Budget = budget
+		opts.Investigate = func(ctx context.Context, c Case, b Budget) (Finding, Spend, error) {
+			if dl, ok := ctx.Deadline(); ok {
+				left = time.Until(dl)
+			}
+			return second.run(ctx, c, b)
+		}
+	})
+	if _, err := o.Resume(t.Context(), caseID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if want := 4*time.Second + InvestigateGrace; left > want || left < want-5*time.Second {
+		t.Errorf("investigate deadline = %s away, want about %s (4s of budget left, not the full %s)",
+			left, want, budget.MaxWallClock+InvestigateGrace)
 	}
 }
 
