@@ -222,5 +222,6 @@ mean "not fetched" rather than "not registered".
 - Integration (`-tags integration`, `make test-integration`): the built binary
   is driven over stdio against a real Prometheus container scraping a
   test-owned `/metrics` endpoint, to catch wire-format drift the fake cannot.
-  CI runs it in its own job on every PR — no API key, no paid calls. Without
-  docker the tests skip, which is why `make check` does not depend on them.
+  CI runs it in its own job on every PR — no API key, no paid calls. The build
+  tag keeps `make check` from compiling these files at all, which is what keeps
+  it to seconds; without docker they skip rather than fail.

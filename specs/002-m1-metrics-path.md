@@ -355,8 +355,12 @@ from day one.
   transition table is **data** (`map[Phase]Phase` per pipeline version), so M2
   inserts phases without touching the walk logic.
 - Each phase is a function `(ctx, *run) (output any, err error)` with a
-  per-phase timeout (intake 10s, investigate = hound wall-clock budget + 30s
-  grace, report 30s).
+  per-phase timeout (intake 10s, investigate = the hound's **remaining**
+  wall-clock budget + 30s grace, report 30s). Remaining means the cap minus the
+  wall clock already recorded against that phase, so a resume gets a deadline
+  sized to the budget it actually has left rather than to a fresh case's cap
+  (§4.3). With the cap disabled there is no remainder, and the default cap plus
+  the grace window is used as a backstop.
 - A phase error → write a `failed` checkpoint (with the error), set case phase
   to `failed`, exit non-zero. **No phase-level retries in v0** — transient
   fault handling lives in the llm middleware; a phase that still fails is a
@@ -408,8 +412,10 @@ it, plus the cursor a resume reads.
   None of them are `omitempty`, so a case file written before intake completes
   carries their zero values (`""`, `null`, `0001-01-01T00:00:00Z`) rather than
   omitting the keys.
-- `work_dir` is recorded for readers of the file; a resume trusts the path it
-  was given instead, so a work dir that has been moved or copied still resumes.
+- `work_dir` is recorded for readers of the file; a resume uses the work root
+  and case ID it was invoked with instead, so a copied work dir still resumes.
+  A *renamed* directory resumes under its new name while `id` keeps the old
+  one — `Resume` backfills `id` only when it is empty.
 - `alert_path` is the alert file the case was opened from, kept so that a
   resume can re-run a failed intake against the corrected file without the
   operator having to re-supply it (§4.3).
