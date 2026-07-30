@@ -365,7 +365,7 @@ from day one.
 - `failed` is terminal for the process but not for the case ID.
 
 Phase contents in M1: **intake** parses one Alertmanager-format alert JSON
-into `Case`, assigns the case ID (`c-<utc yyyymmddhhmmss>-<6 hex crypto/rand>`),
+into `Case`, assigns the case ID (`c-<utc yyyymmddThhmmss>-<6 hex crypto/rand>`),
 creates the work dir. **investigate** runs metrics-hound (§3). **report**
 renders `report.json` + pretty terminal output from the Finding (hypothesis,
 confidence, evidence table, dead ends, spend footer).
