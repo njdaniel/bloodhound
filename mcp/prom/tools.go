@@ -212,11 +212,19 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			//
 			// Since issue #33 the floor is what the spec says it is:
 			// thinPoints shrinks every series of three or more points, so
-			// reaching here means every series is down to its first and last
-			// sample and maxPts is at most 2. What is left is labels, stats
-			// and series count — none of which this step can thin — so the
-			// advice points at the selector.
-			notes = append(notes, fmt.Sprintf("Result exceeds the %s response cap and no further thinning is possible: every series is already reduced to its first and last points (at most %d per series remain); it is returned oversized. The remaining size is labels and series count, not points, so narrow the selector.",
+			// reaching here means no series holds more than its first and
+			// last sample and maxPts is at most 2. It can be less — a series
+			// with a single sample in the window never entered thinning at
+			// all — which is why the note reports the count rather than
+			// asserting that two points remain, and why it describes the
+			// floor instead of claiming a reduction happened: on this path
+			// points_thinned may well be false.
+			//
+			// What is left is labels, stats and series count, none of which
+			// this step can thin. Both remedies are offered: the selector is
+			// the direct one, and a shorter window is the indirect one, since
+			// query_range only returns series with samples inside it.
+			notes = append(notes, fmt.Sprintf("Result exceeds the %s response cap and cannot be thinned further: the keep-first-and-last rule bottoms out at two points per series and none holds more (at most %d). It is returned oversized. What remains is labels, stats and series count, not points — narrow the selector, or shorten the window, which returns only the series with samples inside it.",
 				byteSize(MaxResponseBytes), maxPts))
 			res.Truncation.Note = joinNotes(notes...)
 			payload, err = json.Marshal(res)
