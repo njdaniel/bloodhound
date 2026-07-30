@@ -8,8 +8,14 @@ GOLANGCI_VERSION := 2.12.2
 # another — every agent worktree under .claude/worktrees/ has the same import
 # paths (issue #25). Keeping the cache inside the checkout gives each worktree
 # its own, so a run only ever reports files it can actually see. `?=` so
-# `GOLANGCI_LINT_CACHE=... make lint` still wins, and CI (fresh checkout, cold
-# cache) is unaffected either way.
+# `GOLANGCI_LINT_CACHE=... make lint` still wins. CI is unaffected: its lint
+# job runs golangci-lint directly rather than through make, and a CI checkout
+# has no siblings to leak from anyway.
+#
+# This only takes effect through `make lint`. A bare `golangci-lint run ./...`
+# still uses the shared cache and can still surface a sibling worktree's
+# findings under a `../` path — the site-local `//nolint` comments (see
+# .golangci.yml) are what keep that survivable, but prefer `make lint`.
 GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
 export GOLANGCI_LINT_CACHE
 
@@ -54,5 +60,8 @@ lint:
 check: fmt vet build test lint
 	@echo "ok"
 
+# The cache path is spelled out rather than expanded from
+# $(GOLANGCI_LINT_CACHE) on purpose: that variable can point anywhere the
+# caller likes, and `rm -rf` on a user-supplied path is a footgun.
 clean:
 	rm -rf bin/ .golangci-cache/

@@ -65,8 +65,9 @@ linters:
     rules:
       # Tests panic freely and assert on concrete errors; the rules above are
       # about production code paths. Deliberately NOT anchored with `^`: the
-      # pattern is a substring match on the suffix `_test.go`, so it keeps
-      # matching under a `../other-worktree/` prefix and cannot fail open.
+      # pattern is matched as an unanchored regexp against the reported path,
+      # so it matches anywhere in that path — including under a
+      # `../other-worktree/` prefix — and cannot fail open.
       - path: _test\.go
         linters:
           - forbidigo
