@@ -129,6 +129,47 @@ func TestBadAlertFileExitsTwoButLeavesAResumableCase(t *testing.T) {
 	}
 }
 
+// TestPipelineMismatchResumeExitsTwo pins issue #24: a resume the orchestrator
+// refuses because the case records a different pipeline version exits 2, not
+// 1. Exit 1 promises the case is resumable once the cause is fixed, and this
+// refusal has deliberately no migration path — an operator wrapper that
+// retries on 1 and gives up on 2 would otherwise loop on it forever.
+func TestPipelineMismatchResumeExitsTwo(t *testing.T) {
+	work := t.TempDir()
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(work, caseID)
+	writeCaseFixture(t, caseDir, caseID)
+
+	// Rewrite the case file under a pipeline version this binary does not
+	// walk: the state an operator is left holding after a pipeline bump.
+	c := readCase(t, caseDir)
+	c.Pipeline = "v-from-the-future"
+	casePath := filepath.Join(caseDir, orchestrator.CaseFile)
+	writeJSONFixture(t, casePath, c)
+	before, err := os.ReadFile(casePath)
+	if err != nil {
+		t.Fatalf("reading case file: %v", err)
+	}
+
+	a, _, _ := stubApp(t)
+	runErr := a.run(t.Context(), []string{"hunt", "--work", work, "--resume", caseID})
+	if !errors.Is(runErr, orchestrator.ErrPipelineMismatch) {
+		t.Fatalf("error = %v, want ErrPipelineMismatch", runErr)
+	}
+	if got := exitCode(runErr); got != 2 {
+		t.Errorf("exit code = %d, want 2; exit 1 would tell a wrapper this case is resumable, and it never will be", got)
+	}
+	// The refusal wrote nothing, so there is nothing an operator could fix and
+	// retry — which is exactly why it must not report as exit 1.
+	after, err := os.ReadFile(casePath)
+	if err != nil {
+		t.Fatalf("reading case file after the refusal: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Errorf("case file changed on a refused resume:\n--- got ---\n%s\n--- want ---\n%s", after, before)
+	}
+}
+
 func TestVersionCommand(t *testing.T) {
 	a, stdout, _ := stubApp(t)
 	if err := a.run(t.Context(), []string{"version"}); err != nil {

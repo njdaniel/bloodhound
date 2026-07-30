@@ -3,7 +3,9 @@
 // specs/002-m1-metrics-path.md §4 for the orchestrator this CLI drives.
 //
 // Exit codes: 0 success, 1 a phase failed (the case is resumable once the
-// cause is fixed), 2 the invocation or the alert file was unusable.
+// cause is fixed), 2 the CLI refused — the invocation, the alert file, or the
+// case named by --resume was unusable, and running the same command again
+// without changing something outside this binary will fail the same way.
 package main
 
 import (
@@ -39,12 +41,14 @@ Environment:
   BLOODHOUND_MCP_PROM path to the mcp-prom server binary
   PROM_URL            Prometheus base URL handed to mcp-prom
 
-Exit codes: 0 ok, 1 phase failure, 2 bad invocation or alert file.
+Exit codes: 0 ok, 1 phase failure (resumable), 2 refused — bad invocation,
+unusable alert file, or a case this binary cannot resume.
 `
 
 // errUsage marks an invocation the CLI refused before doing any work. It maps
-// to exit code 2, the same code a bad alert file gets: both mean "fix the
-// command, nothing happened".
+// to exit code 2, the same code a bad alert file and a refused resume get: all
+// three mean "fix something first, retrying this as-is changes nothing". See
+// exitCode for the full contract.
 var errUsage = errors.New("usage")
 
 func main() {
@@ -63,11 +67,21 @@ func main() {
 }
 
 // exitCode maps a command error to the process exit status.
+//
+// The split that matters to an operator wrapper is between 1 and 2: exit 1
+// promises the case is resumable once the cause is fixed, so a wrapper may
+// retry it; exit 2 promises the opposite, so a wrapper must stop and surface
+// the error. ErrPipelineMismatch belongs to 2 (issue #24): the orchestrator
+// refuses that case with deliberately no migration path, so it is not
+// resumable by this binary at any cost, and reporting it as 1 would make a
+// retrying wrapper loop on it forever.
 func exitCode(err error) int {
 	switch {
 	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
-	case errors.Is(err, errUsage), errors.Is(err, orchestrator.ErrBadAlert):
+	case errors.Is(err, errUsage),
+		errors.Is(err, orchestrator.ErrBadAlert),
+		errors.Is(err, orchestrator.ErrPipelineMismatch):
 		return 2
 	default:
 		return 1
