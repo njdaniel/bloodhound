@@ -355,8 +355,12 @@ from day one.
   transition table is **data** (`map[Phase]Phase` per pipeline version), so M2
   inserts phases without touching the walk logic.
 - Each phase is a function `(ctx, *run) (output any, err error)` with a
-  per-phase timeout (intake 10s, investigate = hound wall-clock budget + 30s
-  grace, report 30s).
+  per-phase timeout (intake 10s, investigate = the hound's **remaining**
+  wall-clock budget + 30s grace, report 30s). Remaining means the cap minus the
+  wall clock already recorded against that phase, so a resume gets a deadline
+  sized to the budget it actually has left rather than to a fresh case's cap
+  (§4.3). With the cap disabled there is no remainder, and the default cap plus
+  the grace window is used as a backstop.
 - A phase error → write a `failed` checkpoint (with the error), set case phase
   to `failed`, exit non-zero. **No phase-level retries in v0** — transient
   fault handling lives in the llm middleware; a phase that still fails is a
@@ -365,7 +369,7 @@ from day one.
 - `failed` is terminal for the process but not for the case ID.
 
 Phase contents in M1: **intake** parses one Alertmanager-format alert JSON
-into `Case`, assigns the case ID (`c-<utc yyyymmddhhmmss>-<6 hex crypto/rand>`),
+into `Case`, assigns the case ID (`c-<utc yyyymmddThhmmss>-<6 hex crypto/rand>`),
 creates the work dir. **investigate** runs metrics-hound (§3). **report**
 renders `report.json` + pretty terminal output from the Finding (hypothesis,
 confidence, evidence table, dead ends, spend footer).
@@ -385,6 +389,41 @@ work/<case-id>/
 ├── report.json
 └── report.txt
 ```
+
+`case.json` is the serialized `orchestrator.Case`: the alert as intake parsed
+it, plus the cursor a resume reads.
+
+```json
+{
+  "id": "c-20260728T101500-a1b2c3",
+  "alert_name": "PodCrashLooping",
+  "labels": { "namespace": "shop", "pod": "checkout-7d9f4b8c6-x2ktn" },
+  "firing_since": "2026-07-28T10:12:30Z",
+  "phase": "investigate",
+  "work_dir": "work/c-20260728T101500-a1b2c3",
+  "alert_path": "fixture.json",
+  "pipeline": "v0"
+}
+```
+
+- `phase` is the phase to run **next** — not the one that last completed — or
+  `done`/`failed`. That is what makes the file a cursor.
+- `alert_name`, `labels` and `firing_since` are filled by the intake phase.
+  None of them are `omitempty`, so a case file written before intake completes
+  carries their zero values (`""`, `null`, `0001-01-01T00:00:00Z`) rather than
+  omitting the keys.
+- `work_dir` is recorded for readers of the file; a resume uses the work root
+  and case ID it was invoked with instead, so a copied work dir still resumes.
+  A *renamed* directory resumes under its new name while `id` keeps the old
+  one — `Resume` backfills `id` only when it is empty.
+- `alert_path` is the alert file the case was opened from, kept so that a
+  resume can re-run a failed intake against the corrected file without the
+  operator having to re-supply it (§4.3).
+- `pipeline` is the version of the transition table this case is being walked
+  with (`v0` in M1) — the field the §4.3 resume refusal turns on.
+
+`alert_path` and `pipeline` are `omitempty`: an unset value is an absent key,
+not an empty string. An absent `pipeline` is a mismatch, not a wildcard (§4.3).
 
 Checkpoint file schema (`schema_version` guards future migrations):
 
