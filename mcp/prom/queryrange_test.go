@@ -227,15 +227,20 @@ func TestQueryRangeSeriesCap(t *testing.T) {
 func TestQueryRangeSizeBackstop(t *testing.T) {
 	fake := newFakeProm(t)
 	// 15 series x 121 points is comfortably over 32 KiB serialized. A spike
-	// at interior index 2 (dropped by the first thinning pass) proves stats
-	// come from full-resolution data.
+	// at interior index 1 proves stats come from full-resolution data: the
+	// first thinning pass keeps 0, 2, 4, … so every odd index is gone from
+	// the output, and stats.max can only still be 99999 if it was computed
+	// before thinning. The index is load-bearing — it was 2 while thinPoints
+	// kept index 1 (issue #33), and moving the stride moved which indices
+	// survive, so an unchanged 2 here would leave the spike sitting in
+	// `points` and the assertion below proving nothing.
 	const nPoints = 121
 	var series []map[string]any
 	for i := 0; i < MaxSeries; i++ {
 		values := make([][2]any, 0, nPoints)
 		for p := 0; p < nPoints; p++ {
 			v := fmt.Sprintf("%d.5", i*1000+p)
-			if p == 2 {
+			if p == 1 {
 				v = "99999"
 			}
 			values = append(values, [2]any{1753700000 + p*30, v})
@@ -270,6 +275,14 @@ func TestQueryRangeSizeBackstop(t *testing.T) {
 		first, last := s.Points[0], s.Points[len(s.Points)-1]
 		if first[0].(float64) != 1753700000 || last[0].(float64) != 1753700000+(nPoints-1)*30 {
 			t.Errorf("series %d first/last timestamps = %v/%v, want originals retained", i, first[0], last[0])
+		}
+		// The spike must be gone from the points, or stats.max could be
+		// reading it back out of the thinned data and the assertion below
+		// would hold even if stats were computed after thinning.
+		for _, p := range s.Points {
+			if p[1] == "99999" {
+				t.Fatalf("series %d still carries the spike at ts %v; the assertion below cannot distinguish full-resolution stats", i, p[0])
+			}
 		}
 		if s.Stats.Max != 99999 {
 			t.Errorf("series %d stats.max = %v, want 99999 (full-resolution, spike was thinned away)", i, s.Stats.Max)
@@ -344,11 +357,100 @@ func TestQueryRangeAllInfiniteSeriesRankDeterministically(t *testing.T) {
 	}
 }
 
+// TestQueryRangeThinsToTheTwoPointFloorToFit is the regression test for issue
+// #33. thinPoints used to have a fixed point at three points per series, so
+// the size backstop stopped there and shipped an oversized payload while a
+// fitting one — the same series at two points — was still reachable.
+//
+// The fixture is the configuration measured during the PR #12 review: 15
+// series, 27 filler labels plus a 19-byte `pod` label ("pod":"checkout-00"),
+// 33 points each. The filler width is tuned, not arbitrary: it places the
+// payload in the narrow band where three points per series overflows the 32
+// KiB cap and two points fits. Outside that band the test proves nothing, so
+// the assertion below also pins that the result is genuinely at the floor.
+// Measured on the code this fixes: 32,984 bytes at the old three-point floor,
+// 216 over the cap; with the fix, 32,514 at two points. (The review's own
+// numbers, 32,943 and 32,369, predate the oversize note added in #34, so they
+// sit a couple of hundred bytes lower.)
+//
+// The margin is thin by construction, and worth knowing before editing
+// anything it depends on. The backstop's passes serialize to 40,701 / 36,545 /
+// 34,396 / 33,322 / 32,784 bytes at 33 / 17 / 9 / 5 / 3 points per series: the
+// three-point stage clears the 32,768-byte cap by just 16 bytes. Shortening
+// the "Points thinned to at most N per series…" note by ~20 characters would
+// let three points fit, and this test would then fail on "kept 3 points, want
+// 2" — a real failure to reason about, not a flake, but the cause is the note,
+// not the backstop.
+func TestQueryRangeThinsToTheTwoPointFloorToFit(t *testing.T) {
+	// Serving the same fixture twice and comparing byte-for-byte also covers
+	// the standing determinism invariant across the extra thinning pass.
+	payload := oversizedFixturePayload(t)
+	if again := oversizedFixturePayload(t); again != payload {
+		t.Errorf("two identical runs produced different payloads:\n first: %s\nsecond: %s", payload, again)
+	}
+	if len(payload) > MaxResponseBytes {
+		t.Errorf("payload is %d bytes, want <= %d: the backstop gave up while a fitting payload was reachable",
+			len(payload), MaxResponseBytes)
+	}
+	var g gotRange
+	if err := json.Unmarshal([]byte(payload), &g); err != nil {
+		t.Fatalf("decoding query_range payload: %v", err)
+	}
+	if !g.Truncation.PointsThinned {
+		t.Error("points_thinned = false, want true")
+	}
+	if strings.Contains(g.Truncation.Note, "exceeds") {
+		t.Errorf("truncation note %q reports an overflow, but the payload fits", g.Truncation.Note)
+	}
+	for i, s := range g.Series {
+		if len(s.Points) != 2 {
+			t.Errorf("series %d kept %d points, want 2 (the fixture only fits at the floor)", i, len(s.Points))
+			continue
+		}
+		if s.Points[0][0].(float64) != 1753700000 || s.Points[1][0].(float64) != 1753700000+32*30 {
+			t.Errorf("series %d kept %v/%v, want the original first and last timestamps",
+				i, s.Points[0][0], s.Points[1][0])
+		}
+	}
+}
+
+// oversizedFixturePayload serves the issue #33 fixture and returns the
+// serialized query_range payload.
+func oversizedFixturePayload(t *testing.T) string {
+	t.Helper()
+	const (
+		nPoints    = 33
+		nFiller    = 27
+		fillerSize = 61 // see the tuning note on the caller
+	)
+	var series []map[string]any
+	for i := 0; i < MaxSeries; i++ {
+		labels := map[string]string{"pod": fmt.Sprintf("checkout-%02d", i)}
+		for k := 0; k < nFiller; k++ {
+			labels[fmt.Sprintf("label_%02d", k)] = strings.Repeat("v", fillerSize)
+		}
+		values := make([][2]any, 0, nPoints)
+		for p := 0; p < nPoints; p++ {
+			values = append(values, [2]any{1753700000 + p*30, fmt.Sprintf("%d", i+p)})
+		}
+		series = append(series, seriesFixture(labels, values))
+	}
+	fake := newFakeProm(t)
+	fake.set("/api/v1/query_range", 200, matrixJSON(t, series))
+	res, _, err := newTestToolServer(fake).handleQueryRange(context.Background(), nil, queryRangeInput{
+		Query: "up", Start: "2026-07-28T10:00:00Z", End: "2026-07-28T11:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("handleQueryRange: %v", err)
+	}
+	return resultText(t, res)
+}
+
 // TestQueryRangeMarksOversizedPayloadAfterThinning covers the size backstop's
 // dead end: series whose label sets alone blow the 32 KiB cap, so thinning
-// reaches a fixed point before the payload fits. The result ships oversized
-// and spec 002 §2.1 requires it to say so rather than pass for a complete
-// result.
+// bottoms out at first-and-last before the payload fits. The result ships
+// oversized and spec 002 §2.1 requires it to say so rather than pass for a
+// complete result.
 func TestQueryRangeMarksOversizedPayloadAfterThinning(t *testing.T) {
 	// 15 series x 30 labels x 120-byte values is well over 32 KiB with only
 	// two points each, so no amount of thinning helps.
@@ -375,10 +477,10 @@ func TestQueryRangeMarksOversizedPayloadAfterThinning(t *testing.T) {
 		// Already at the two-point floor: the very first backstop pass has
 		// nothing to thin and must still mark the overflow.
 		{"nothing left to thin", 2, false},
-		// Thins over several passes until thinPoints reaches its fixed
-		// point, then gives up: both the thinning and the overflow have to
-		// be recorded.
-		{"thinned to a fixed point and still too big", 33, true},
+		// Thins over several passes down to the two-point floor and still
+		// does not fit, because the bulk is labels: both the thinning and
+		// the overflow have to be recorded.
+		{"thinned to the floor and still too big", 33, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -404,9 +506,13 @@ func TestQueryRangeMarksOversizedPayloadAfterThinning(t *testing.T) {
 			if tc.wantThinned && !strings.Contains(g.Truncation.Note, "Points thinned") {
 				t.Errorf("truncation note %q dropped the thinning sentence it had already earned", g.Truncation.Note)
 			}
+			// Giving up is only correct at the floor: two points, whatever
+			// the series started with. "Fewer than it started with" would
+			// also pass on a backstop that stalled at three, which is the
+			// bug of issue #33.
 			for i, s := range g.Series {
-				if len(s.Points) >= tc.nPoints && tc.wantThinned {
-					t.Fatalf("series %d kept %d of %d points; the backstop stopped short", i, len(s.Points), tc.nPoints)
+				if len(s.Points) != 2 {
+					t.Errorf("series %d kept %d of %d points; the dead end is only reachable at the two-point floor", i, len(s.Points), tc.nPoints)
 				}
 			}
 		})

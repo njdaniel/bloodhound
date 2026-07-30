@@ -204,17 +204,27 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			}
 		}
 		if !changed {
-			// Thinning has reached a fixed point and the payload still does
-			// not fit, so it ships oversized. Say so: an unmarked overflow
-			// is the one thing §2.1 rules out, because the model would read
-			// a capped result as a complete one. The note itself adds bytes
-			// to an already-oversized payload, which is the cheaper cost.
+			// Thinning has reached its floor and the payload still does not
+			// fit, so it ships oversized. Say so: an unmarked overflow is the
+			// one thing §2.1 rules out, because the model would read a capped
+			// result as a complete one. The note itself adds bytes to an
+			// already-oversized payload, which is the cheaper cost.
 			//
-			// "Fixed point" is not the same as "two points left". thinPoints
-			// keeps index 1 of every series, so a 3-point series thins to
-			// itself and the loop stops there — the note says what the rule
-			// can no longer do, not that the floor was reached.
-			notes = append(notes, fmt.Sprintf("Result exceeds the %s response cap and no further thinning is possible under the keep-first-and-last rule (at most %d points per series remain); it is returned oversized. Narrow the selector or the window.",
+			// Since issue #33 the floor is what the spec says it is:
+			// thinPoints shrinks every series of three or more points, so
+			// reaching here means no series holds more than its first and
+			// last sample and maxPts is at most 2. It can be less — a series
+			// with a single sample in the window never entered thinning at
+			// all — which is why the note reports the count rather than
+			// asserting that two points remain, and why it describes the
+			// floor instead of claiming a reduction happened: on this path
+			// points_thinned may well be false.
+			//
+			// What is left is labels, stats and series count, none of which
+			// this step can thin. Both remedies are offered: the selector is
+			// the direct one, and a shorter window is the indirect one, since
+			// query_range only returns series with samples inside it.
+			notes = append(notes, fmt.Sprintf("Result exceeds the %s response cap and cannot be thinned further: the keep-first-and-last rule bottoms out at two points per series and none holds more (at most %d). It is returned oversized. What remains is labels, stats and series count, not points — narrow the selector, or shorten the window, which returns only the series with samples inside it.",
 				byteSize(MaxResponseBytes), maxPts))
 			res.Truncation.Note = joinNotes(notes...)
 			payload, err = json.Marshal(res)

@@ -179,6 +179,49 @@ func rankSeries(rs []rankedSeries) {
 // thinPoints drops every second interior point, always keeping the first and
 // last samples (spec 002 §2.3 step 6). Series with two or fewer points are
 // returned unchanged. The second return reports whether anything was dropped.
+//
+// The interior stride starts at index 2, and that detail is load-bearing twice
+// over.
+//
+// It is what makes the rule converge. Output length is floor((n−2)/2)+2,
+// strictly less than n for every n ≥ 3, so repeated application walks
+// 33 → 17 → 9 → 5 → 3 → 2 and halts on the two-point floor the spec describes.
+// A stride starting at index 1 keeps index 1, so a 3-point series thins to
+// itself and reports no change: a fixed point one point above the floor, which
+// stalled the query_range size backstop while a fitting payload was still
+// reachable (issue #33).
+//
+// It also samples better than the stride it replaced. Retained indices:
+//
+//	n=3   0,2                  → 2 points   (old: 0,1,2 — no change)
+//	n=5   0,2,4                → 3 points   (old: 0,1,3,4)
+//	n=8   0,2,4,6,7            → 5 points   (old: 0,1,3,5,7)
+//	n=9   0,2,4,6,8            → 5 points   (old: 0,1,3,5,7,8)
+//	n=33  0,2,4,…,30,32        → 17 points  (old: 0,1,3,…,31,32)
+//
+// One pass on an odd n keeps only even indices, so the survivors are an evenly
+// spaced grid. Whether the whole chain stays uniform is a narrower claim: an
+// odd n = 2k+1 retains k+1 points, which is odd again only when n ≡ 1 (mod 4),
+// so the uniform 33 → 17 → 9 → 5 → 3 → 2 above is the n = 2^j+1 family, not
+// odd n in general — n=7 goes 0,2,4,6 (uniform) then 0,4,6, and n=11 reaches
+// gaps of 8,2 by its third pass. The canonical input is in that second case,
+// since MaxPointsPerSeries and effectiveStep clamp a full-window query to 121
+// points:
+//
+//	121 → 61 → 31 → 16 → 9 → 5 → 3 → 2
+//	gaps:  2…   4…   8…   16×7,8   32×3,24   64,56   120
+//
+// So the grid is exactly uniform for the first three passes and then carries
+// one odd gap. That gap is bounded and lands where it hurts least: it is
+// always the final one and always shorter than the rest, so the newest samples
+// are never thinned harder than the window average — which for incident work
+// is the end you want intact. The old stride put its irregular gaps at both
+// ends (n=9 kept 0,1 and 7,8), spending extra points on the start of the
+// window, and on n=3 it kept everything.
+//
+// First and last are appended unconditionally and the loop's bound (i < n−1)
+// keeps it from re-adding the last, so the endpoints survive every pass at
+// every n — the property the model is told about in the truncation note.
 func thinPoints(pts []point) ([]point, bool) {
 	n := len(pts)
 	if n <= 2 {
@@ -186,7 +229,7 @@ func thinPoints(pts []point) ([]point, bool) {
 	}
 	out := make([]point, 0, n/2+2)
 	out = append(out, pts[0])
-	for i := 1; i < n-1; i += 2 {
+	for i := 2; i < n-1; i += 2 {
 		out = append(out, pts[i])
 	}
 	out = append(out, pts[n-1])
