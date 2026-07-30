@@ -2,10 +2,12 @@
 // agent pack. See specs/001-build-spec.md for the architecture and
 // specs/002-m1-metrics-path.md §4 for the orchestrator this CLI drives.
 //
-// Exit codes: 0 success, 1 a phase failed (the case is resumable once the
-// cause is fixed), 2 the CLI refused — the invocation, the alert file, or the
-// case named by --resume was unusable, and running the same command again
-// without changing something outside this binary will fail the same way.
+// Exit codes: 0 success, 1 the command failed, 2 the CLI refused — a bad
+// invocation, an unusable alert file, or a case whose recorded pipeline
+// version is not the one this binary walks (recording none counts as a
+// mismatch). A failed phase leaves a resumable case, but exit 1 is also the
+// catch-all for failures that leave nothing to resume, so it is not on its own
+// a signal that retrying will help; see exitCode.
 package main
 
 import (
@@ -41,14 +43,16 @@ Environment:
   BLOODHOUND_MCP_PROM path to the mcp-prom server binary
   PROM_URL            Prometheus base URL handed to mcp-prom
 
-Exit codes: 0 ok, 1 phase failure (resumable), 2 refused — bad invocation,
-unusable alert file, or a case this binary cannot resume.
+Exit codes: 0 ok, 1 the command failed (a failed phase leaves a resumable
+case; other failures may leave nothing to resume), 2 refused — bad
+invocation, unusable alert file, or a case whose recorded pipeline version
+is not the one this binary walks (a case recording none is a mismatch too).
 `
 
 // errUsage marks an invocation the CLI refused before doing any work. It maps
-// to exit code 2, the same code a bad alert file and a refused resume get: all
-// three mean "fix something first, retrying this as-is changes nothing". See
-// exitCode for the full contract.
+// to exit code 2, the same code an unusable alert file and a pipeline-version
+// mismatch get: all three mean "fix something first, retrying this as-is
+// changes nothing". See exitCode for the full contract.
 var errUsage = errors.New("usage")
 
 func main() {
@@ -68,13 +72,21 @@ func main() {
 
 // exitCode maps a command error to the process exit status.
 //
-// The split that matters to an operator wrapper is between 1 and 2: exit 1
-// promises the case is resumable once the cause is fixed, so a wrapper may
-// retry it; exit 2 promises the opposite, so a wrapper must stop and surface
-// the error. ErrPipelineMismatch belongs to 2 (issue #24): the orchestrator
-// refuses that case with deliberately no migration path, so it is not
-// resumable by this binary at any cost, and reporting it as 1 would make a
-// retrying wrapper loop on it forever.
+// Exit 2 is the closed set enumerated below, and only that set: the CLI
+// refused, and rerunning the same command without first changing something
+// outside this binary will fail identically. ErrPipelineMismatch belongs here
+// (issue #24) — the orchestrator refuses that case with deliberately no
+// migration path, so it is not resumable at any cost, and reporting it as 1
+// would make a wrapper that retries exit 1 loop on it forever.
+//
+// Exit 1 is the catch-all default, so it is weaker than its name suggests. A
+// failed phase does leave a resumable case: ErrBudgetExhausted is the clean
+// example, where raising --max-tokens and resuming succeeds. But exit 1 also
+// catches failures that leave nothing to resume — serve and replay before M2,
+// an empty --work, and a cost or resume against a case dir that is missing or
+// undecodable. A wrapper must not read exit 1 on its own as "retrying will
+// help". Whether those belong in 2 as well is a separate contract decision,
+// tracked outside this change.
 func exitCode(err error) int {
 	switch {
 	case err == nil, errors.Is(err, flag.ErrHelp):

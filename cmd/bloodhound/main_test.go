@@ -131,9 +131,9 @@ func TestBadAlertFileExitsTwoButLeavesAResumableCase(t *testing.T) {
 
 // TestPipelineMismatchResumeExitsTwo pins issue #24: a resume the orchestrator
 // refuses because the case records a different pipeline version exits 2, not
-// 1. Exit 1 promises the case is resumable once the cause is fixed, and this
-// refusal has deliberately no migration path — an operator wrapper that
-// retries on 1 and gives up on 2 would otherwise loop on it forever.
+// 1. Exit 1 is the arm a retrying operator wrapper keys on, and this refusal
+// has deliberately no migration path, so reporting it as 1 would make such a
+// wrapper loop on a case that can never be resumed.
 func TestPipelineMismatchResumeExitsTwo(t *testing.T) {
 	work := t.TempDir()
 	caseID := "c-20260728T101500-a1b2c3"
@@ -157,10 +157,14 @@ func TestPipelineMismatchResumeExitsTwo(t *testing.T) {
 		t.Fatalf("error = %v, want ErrPipelineMismatch", runErr)
 	}
 	if got := exitCode(runErr); got != 2 {
-		t.Errorf("exit code = %d, want 2; exit 1 would tell a wrapper this case is resumable, and it never will be", got)
+		t.Errorf("exit code = %d, want 2; exit 1 is the arm a retrying wrapper keys on, and this case can never be resumed", got)
 	}
-	// The refusal wrote nothing, so there is nothing an operator could fix and
-	// retry — which is exactly why it must not report as exit 1.
+	// case.json is byte-identical afterwards: the refusal did not advance the
+	// case, so there is nothing an operator could fix and retry. This checks
+	// only the one file. That the whole work dir is untouched — no store
+	// skeleton recreated, no checkpoint written — is pinned a layer down by
+	// orchestrator.TestResumeRefusesPipelineVersionMismatch, which compares
+	// full directory state.
 	after, err := os.ReadFile(casePath)
 	if err != nil {
 		t.Fatalf("reading case file after the refusal: %v", err)
