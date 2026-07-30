@@ -233,4 +233,7 @@ mean "not fetched" rather than "not registered".
   asserted rather than assumed.
 - The verbatim pass-through of a *non-truncation* warning is unit-test-only:
   Prometheus v3.5.0 emits no such warning on `/api/v1/series`, so provoking it
-  needs a backend (Thanos, Cortex) this suite does not run.
+  needs a fanout backend (Thanos, Cortex) this suite does not run. A failing
+  `remote_read` does warn, but only on `/api/v1/query` — not on
+  `/api/v1/series`, which is the only endpoint `series_metadata` reads
+  warnings from.

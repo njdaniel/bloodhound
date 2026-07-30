@@ -170,7 +170,9 @@ func TestSeriesMetadataUpstreamCapsAgainstRealPrometheus(t *testing.T) {
 // says so in a warning whose wording seriesCapped can recognise, and that a
 // truncated /api/v1/metadata says nothing at all.
 func capWireBehaviour(t *testing.T, workload *promtest.BulkWorkload, srv *promtest.Server, selector string) {
-	t.Helper()
+	// Deliberately not t.Helper(): this function *is* the subtest, not an
+	// assertion helper, and marking it would collapse every failure below onto
+	// the t.Run line instead of the assertion that fired.
 
 	// The tool's own window, so the call under test is the call being pinned.
 	end := time.Now()
@@ -223,6 +225,13 @@ func capWireBehaviour(t *testing.T, workload *promtest.BulkWorkload, srv *promte
 	// there is nothing else to detect it by.
 	var fullMeta map[string]json.RawMessage
 	promAPI(t, srv, "/api/v1/metadata", nil, &fullMeta)
+	// The fixture size is derived from MaxUpstreamMetadata, and the two caps are
+	// only coincidentally equal. Raise MaxUpstreamSeries above the fixture and
+	// the series half stops being able to fire; without this guard the failure
+	// blames truncation rather than the fixture.
+	if len(fullMeta) <= MaxUpstreamSeries {
+		t.Fatalf("prometheus knows %d metrics, want more than MaxUpstreamSeries (%d) or the series cap cannot fire", len(fullMeta), MaxUpstreamSeries)
+	}
 	if len(fullMeta) <= MaxUpstreamMetadata {
 		t.Fatalf("prometheus knows %d metrics, want more than MaxUpstreamMetadata (%d) or the cap cannot fire", len(fullMeta), MaxUpstreamMetadata)
 	}
@@ -259,7 +268,7 @@ func capWireBehaviour(t *testing.T, workload *promtest.BulkWorkload, srv *promte
 // more metrics than either upstream cap allows, and checks that both caps are
 // reported to the model.
 func capToolReport(t *testing.T, srv *promtest.Server, selector string) {
-	t.Helper()
+	// Not t.Helper(), for the same reason as capWireBehaviour.
 	session := connect(t, srv.URL)
 
 	var got wireMetadataResult
