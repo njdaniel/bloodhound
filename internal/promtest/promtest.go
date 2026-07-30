@@ -166,7 +166,10 @@ func Start(ctx context.Context, cfg Config) (_ *Server, err error) {
 	}
 	if err := srv.waitReady(ctx); err != nil {
 		logs, _ := srv.Logs(ctx)
-		stopErr := srv.Stop()
+		// Stop deliberately does not take the caller's context: ctx is the one
+		// that just expired or was cancelled, and the container has to be
+		// removed either way or it outlives the test run.
+		stopErr := srv.Stop() //nolint:contextcheck // cleanup must not inherit the failed context
 		if stopErr != nil {
 			return nil, fmt.Errorf("%w (and stopping the container failed: %w); container logs:\n%s", err, stopErr, logs)
 		}
@@ -324,7 +327,9 @@ func (s *Server) instantSampleCount(ctx context.Context, hc *http.Client, expr s
 // in practice the ephemeral range does not wrap around that fast, and the
 // alternative is a docker SDK dependency.
 func freePort() (string, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	// A context would buy nothing here: the listen is on loopback with no
+	// resolution step, so it either returns immediately or not at all.
+	l, err := net.Listen("tcp", "127.0.0.1:0") //nolint:noctx // loopback listen; nothing to cancel
 	if err != nil {
 		return "", fmt.Errorf("reserving a port: %w", err)
 	}
