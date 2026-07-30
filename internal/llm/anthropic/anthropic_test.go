@@ -289,6 +289,32 @@ func TestCompleteSurfacesAPIErrorsWithoutRetrying(t *testing.T) {
 	}
 }
 
+// TestCallerCannotReEnableSDKRetries pins the option ordering in New: the
+// WithMaxRetries(0) override is applied after the caller's options, so a
+// caller cannot re-enable SDK retries and hide attempts from the retry,
+// accounting and capture middleware.
+func TestCallerCannotReEnableSDKRetries(t *testing.T) {
+	const errBody = `{"type":"error","error":{"type":"api_error","message":"boom"}}`
+	fake := newFakeAPI(t, errBody, errBody, errBody, errBody)
+	fake.statuses = []int{500, 500, 500, 500}
+	p := New(Config{Model: "claude-test-1"},
+		option.WithBaseURL(fake.server.URL),
+		option.WithAPIKey("test-key-not-real"),
+		option.WithMaxRetries(3), // must lose to the provider's own override
+	)
+
+	_, err := p.Complete(context.Background(), llm.Request{
+		MaxTokens: 64,
+		Messages:  []llm.Message{llm.UserMessage(llm.TextBlock("x"))},
+	})
+	if err == nil {
+		t.Fatal("Complete succeeded, want API error")
+	}
+	if fake.hits != 1 {
+		t.Errorf("hits = %d, want 1 — a caller's WithMaxRetries must not re-enable SDK retries", fake.hits)
+	}
+}
+
 // TestCompleteTranslatesAPIErrors pins the provider boundary: the SDK's error
 // type stops here, converted into llm.APIError so that retry policy never has
 // to know which backend failed. The status must survive the translation — it

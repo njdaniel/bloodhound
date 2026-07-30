@@ -43,10 +43,17 @@ type Provider struct {
 
 // New builds a Provider from cfg. Extra request options (API key, base URL for
 // tests, timeouts) are passed through to the SDK client; by default the API
-// key comes from ANTHROPIC_API_KEY. SDK-level retries are disabled so the
-// retry middleware sees and controls every attempt.
+// key comes from ANTHROPIC_API_KEY.
+//
+// Disabling SDK-level retries is not one of the pass-through options: it is
+// applied last, so it wins over any option.WithMaxRetries a caller supplies.
+// Retry policy lives in exactly one place — the middleware package — and a
+// caller re-enabling SDK retries would silently hide attempts from the retry,
+// accounting and capture layers. This is deliberate and not an escape hatch:
+// changing the retry behaviour means changing the middleware, not this
+// constructor's arguments.
 func New(cfg Config, opts ...option.RequestOption) *Provider {
-	opts = append([]option.RequestOption{option.WithMaxRetries(0)}, opts...)
+	opts = append(append([]option.RequestOption{}, opts...), option.WithMaxRetries(0))
 	return &Provider{cfg: cfg, client: sdk.NewClient(opts...)}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/njdaniel/bloodhound/internal/llm"
@@ -110,7 +111,10 @@ func (c *Capture) write(rec CaptureRecord) error {
 }
 
 // nextSeq returns one past the highest sequence number already present in
-// dir, or 0 for an empty directory.
+// dir, or 0 for an empty directory. The sequence prefix is every digit up to
+// the first '-', not a fixed three: %03d is a minimum width, so past seq 999
+// filenames grow to 1000-<label>.json and a fixed-width parser would skip
+// them and restart numbering into a collision.
 func nextSeq(dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -118,12 +122,8 @@ func nextSeq(dir string) (int, error) {
 	}
 	next := 0
 	for _, e := range entries {
-		name := e.Name()
-		if len(name) < 4 || name[3] != '-' {
-			continue
-		}
-		n, err := strconv.Atoi(name[:3])
-		if err != nil {
+		n, ok := seqPrefix(e.Name())
+		if !ok {
 			continue
 		}
 		if n+1 > next {
@@ -131,4 +131,28 @@ func nextSeq(dir string) (int, error) {
 		}
 	}
 	return next, nil
+}
+
+// seqPrefix parses the leading run of digits before the first '-' in a
+// capture filename. It reports false for any name that does not start with
+// at least one digit followed by '-', and for values above math.MaxInt32: the
+// bound keeps nextSeq's n+1 from overflowing on a corrupt or hand-planted
+// name, which would wrap negative and silently restart numbering on top of
+// existing captures. ~2e9 is headroom no real case will approach.
+func seqPrefix(name string) (int, bool) {
+	i := strings.IndexByte(name, '-')
+	if i <= 0 {
+		return 0, false
+	}
+	digits := name[:i]
+	for j := 0; j < len(digits); j++ {
+		if digits[j] < '0' || digits[j] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(digits, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return int(n), true
 }

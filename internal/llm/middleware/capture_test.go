@@ -124,6 +124,109 @@ func TestCaptureContinuesSequenceAfterResume(t *testing.T) {
 	}
 }
 
+// TestCaptureContinuesSequencePastThreeDigits pins the resume behaviour once
+// a case has run long enough to leave four-digit capture files behind: a
+// fixed-width parser skips 1000-hound.json, restarts numbering, and overwrites
+// earlier captures.
+func TestCaptureContinuesSequencePastThreeDigits(t *testing.T) {
+	req, resp := goldenFixtures()
+	dir := t.TempDir()
+	llmDir := filepath.Join(dir, "llm")
+	if err := os.MkdirAll(llmDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, name := range []string{"000-hound.json", "999-hound.json", "1000-hound.json"} {
+		if err := os.WriteFile(filepath.Join(llmDir, name), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("seeding capture file %s: %v", name, err)
+		}
+	}
+
+	c, err := NewCapture(llmtest.New(t, resp), dir, "hound")
+	if err != nil {
+		t.Fatalf("NewCapture: %v", err)
+	}
+	if _, err := c.Complete(context.Background(), req); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(llmDir, "1001-hound.json")); err != nil {
+		t.Errorf("expected sequence to continue at 1001: %v", err)
+	}
+	// The seeded files must still be exactly as seeded: a restarted sequence
+	// shows up as a capture file overwritten with a real record.
+	for _, name := range []string{"000-hound.json", "999-hound.json", "1000-hound.json"} {
+		data, err := os.ReadFile(filepath.Join(llmDir, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		if string(data) != "{}\n" {
+			t.Errorf("%s was overwritten: sequence numbering collided", name)
+		}
+	}
+}
+
+func TestNextSeqParsesSequencePrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []string
+		want  int
+	}{
+		{"empty dir", nil, 0},
+		{"three digits", []string{"005-hound.json"}, 6},
+		{"four digits", []string{"1000-hound.json"}, 1001},
+		{"mixed widths", []string{"999-hound.json", "1234-hound.json"}, 1235},
+		{"label contains a dash", []string{"012-metrics-hound.json"}, 13},
+		{"no sequence prefix", []string{"notes.json", "-hound.json", "abc-hound.json"}, 0},
+		{"prefix beyond the bound", []string{"10000000000-hound.json"}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range tt.files {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o644); err != nil {
+					t.Fatalf("seeding %s: %v", name, err)
+				}
+			}
+			got, err := nextSeq(dir)
+			if err != nil {
+				t.Fatalf("nextSeq: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("nextSeq = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSeqPrefixRejectsOverflowingValues guards the one way the widened parser
+// could be worse than the fixed-width one it replaced: a corrupt or
+// hand-planted name whose digits parse but whose n+1 overflows, wrapping
+// negative so nextSeq ignores it and restarts numbering over live captures.
+// The parse is bounded so that value is unrepresentable.
+func TestSeqPrefixRejectsOverflowingValues(t *testing.T) {
+	for _, name := range []string{
+		"9223372036854775807-hound.json", // math.MaxInt64: n+1 wraps to MinInt64
+		"10000000000-hound.json",         // 1e10: parses on 64-bit, far past any real case
+	} {
+		if n, ok := seqPrefix(name); ok {
+			t.Errorf("seqPrefix(%q) = %d, true; want rejected (bounded parse)", name, n)
+		}
+	}
+	// And through nextSeq: a planted name must not steer live numbering.
+	dir := t.TempDir()
+	for _, name := range []string{"9223372036854775807-hound.json", "005-hound.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}\n"), 0o644); err != nil {
+			t.Fatalf("seeding %s: %v", name, err)
+		}
+	}
+	got, err := nextSeq(dir)
+	if err != nil {
+		t.Fatalf("nextSeq: %v", err)
+	}
+	if got != 6 {
+		t.Errorf("nextSeq = %d, want 6 (the planted name is ignored, 005 still counts)", got)
+	}
+}
+
 func TestCaptureRecordsErrors(t *testing.T) {
 	req, _ := goldenFixtures()
 	dir := t.TempDir()
