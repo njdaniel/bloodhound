@@ -30,7 +30,8 @@ const (
 
 // ErrBadAlert marks a case that cannot start because its alert file is
 // missing, unreadable, or not a usable Alertmanager alert. The CLI maps it to
-// exit code 2; every other phase failure is exit 1.
+// exit code 2, as it does ErrPipelineMismatch; every other phase failure is
+// exit 1.
 var ErrBadAlert = errors.New("orchestrator: unusable alert file")
 
 // ErrBudgetExhausted reports that spend already recorded in this case's
@@ -48,6 +49,10 @@ var ErrBudgetExhausted = errors.New("orchestrator: budget exhausted by prior att
 // recording no pipeline version at all is a mismatch too: it is not a v0 case,
 // it is a case of unknown provenance. There is deliberately no migration path;
 // refusing is the whole behaviour.
+//
+// Because that refusal is permanent, the CLI maps it to exit code 2 and not to
+// the exit 1 of a resumable phase failure: no phase ran, nothing was written,
+// and no amount of retrying will make the case resumable (issue #24).
 var ErrPipelineMismatch = errors.New("orchestrator: case was written by a different pipeline version")
 
 // InvestigateFunc runs the investigation for a case and reports what it cost.

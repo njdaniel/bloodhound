@@ -129,6 +129,51 @@ func TestBadAlertFileExitsTwoButLeavesAResumableCase(t *testing.T) {
 	}
 }
 
+// TestPipelineMismatchResumeExitsTwo pins issue #24: a resume the orchestrator
+// refuses because the case records a different pipeline version exits 2, not
+// 1. Exit 1 is the arm a retrying operator wrapper keys on, and this refusal
+// has deliberately no migration path, so reporting it as 1 would make such a
+// wrapper loop on a case that can never be resumed.
+func TestPipelineMismatchResumeExitsTwo(t *testing.T) {
+	work := t.TempDir()
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(work, caseID)
+	writeCaseFixture(t, caseDir, caseID)
+
+	// Rewrite the case file under a pipeline version this binary does not
+	// walk: the state an operator is left holding after a pipeline bump.
+	c := readCase(t, caseDir)
+	c.Pipeline = "v-from-the-future"
+	casePath := filepath.Join(caseDir, orchestrator.CaseFile)
+	writeJSONFixture(t, casePath, c)
+	before, err := os.ReadFile(casePath)
+	if err != nil {
+		t.Fatalf("reading case file: %v", err)
+	}
+
+	a, _, _ := stubApp(t)
+	runErr := a.run(t.Context(), []string{"hunt", "--work", work, "--resume", caseID})
+	if !errors.Is(runErr, orchestrator.ErrPipelineMismatch) {
+		t.Fatalf("error = %v, want ErrPipelineMismatch", runErr)
+	}
+	if got := exitCode(runErr); got != 2 {
+		t.Errorf("exit code = %d, want 2; exit 1 is the arm a retrying wrapper keys on, and this case can never be resumed", got)
+	}
+	// case.json is byte-identical afterwards: the refusal did not advance the
+	// case, so there is nothing an operator could fix and retry. This checks
+	// only the one file. That the whole work dir is untouched — no store
+	// skeleton recreated, no checkpoint written — is pinned a layer down by
+	// orchestrator.TestResumeRefusesPipelineVersionMismatch, which compares
+	// full directory state.
+	after, err := os.ReadFile(casePath)
+	if err != nil {
+		t.Fatalf("reading case file after the refusal: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Errorf("case file changed on a refused resume:\n--- got ---\n%s\n--- want ---\n%s", after, before)
+	}
+}
+
 func TestVersionCommand(t *testing.T) {
 	a, stdout, _ := stubApp(t)
 	if err := a.run(t.Context(), []string{"version"}); err != nil {

@@ -425,7 +425,10 @@ will build on):
    index, orphan the file written under the old one, and make the checkpoint
    sum double-count that phase's spend. There is deliberately **no migration
    path**: refusing is the whole behaviour, and a case file that records no
-   pipeline version at all is a mismatch too.
+   pipeline version at all is a mismatch too. Because the refusal is permanent,
+   the CLI reports it as **exit 2**, not the exit 1 of a resumable phase
+   failure — an operator wrapper that retries exit 1 must not loop on a case
+   that can never be resumed.
 2. Enumerate `checkpoints/`.
 3. Every phase with a `completed` checkpoint is **loaded, never re-executed** —
    its `output` is deserialized as that phase's result.
@@ -489,7 +492,8 @@ container test is a smoke check; nothing in CI's default path calls a paid API.
 - `hunt --alert fixture.json` with scripted provider + fake Prometheus:
   exit 0, work dir complete, `report.json` matches golden.
 - `hunt --resume` on the kill-mid-investigate work dir (the §4.3 acceptance
-  test). Exit codes: bad alert file 2, phase failure 1.
+  test). Exit codes: bad alert file 2, pipeline-version mismatch on resume 2,
+  phase failure 1.
 
 **Live demo (manual, documented in the PR, not CI):** kind cluster + Prometheus
 scraping it; break a pod manually (bad image or CPU-starved limits); craft the
