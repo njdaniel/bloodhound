@@ -35,13 +35,20 @@ import (
 // there can ever fire. These tests use a fixture large enough that both do.
 
 // bulkMetricCount is how many distinct metric names the bulk fixture registers.
-// Three times MaxUpstreamMetadata is chosen, not arbitrary: metadata
-// truncation keeps an arbitrary subset, so the test needs the odds of all
-// MaxMetadataMetrics returned metrics happening to keep their metadata to be
-// negligible. At a one-in-three survival rate that is (1/3)^25, around 1e-12.
-// The count also has to exceed MaxUpstreamSeries, which it does by the same
-// margin since the fixture exports one series per metric name.
-const bulkMetricCount = 3 * MaxUpstreamMetadata
+// Three times the larger cap, and neither part of that is arbitrary.
+//
+// Three, because metadata truncation keeps an arbitrary subset, so the test
+// needs the odds of all MaxMetadataMetrics returned metrics happening to keep
+// their metadata to be negligible. At a one-in-three survival rate that is
+// (1/3)^25, around 1e-12.
+//
+// The larger cap, because the fixture has to exceed *both* — one series per
+// metric name, so the same count has to overflow MaxUpstreamSeries on
+// /api/v1/series and MaxUpstreamMetadata on /api/v1/metadata. The two are
+// independently configurable and only happen to be equal today; deriving from
+// one of them would silently stop exercising the other half the moment they
+// diverge.
+const bulkMetricCount = 3 * max(MaxUpstreamMetadata, MaxUpstreamSeries)
 
 // realSeriesTruncationWarning is what Prometheus v3.5.0 actually puts in the
 // warnings array of a /api/v1/series response it truncated at the requested
@@ -183,6 +190,20 @@ func capWireBehaviour(t *testing.T, workload *promtest.BulkWorkload, srv *promte
 		"end":     {formatTime(end)},
 	}
 
+	// Neither cap can fire against a fixture that does not overflow it, and a
+	// fixture that is too small fails later as a confusing truncation error
+	// rather than as itself. Check both up front, before any assertion that
+	// would misattribute the cause. bulkMetricCount is derived from the larger
+	// cap so this should be unreachable; it is here because the caps are
+	// independently configurable and a future edit is exactly what would break
+	// the derivation.
+	if workload.Count() <= MaxUpstreamSeries {
+		t.Fatalf("fixture exports %d series, want more than MaxUpstreamSeries (%d) or the series cap cannot fire", workload.Count(), MaxUpstreamSeries)
+	}
+	if workload.Count() <= MaxUpstreamMetadata {
+		t.Fatalf("fixture exports %d metrics, want more than MaxUpstreamMetadata (%d) or the metadata cap cannot fire", workload.Count(), MaxUpstreamMetadata)
+	}
+
 	// Control: with no limit the same selector returns every fixture series and
 	// the server is silent. Without this, a warning below could be ambient
 	// rather than caused by the limit.
@@ -225,16 +246,6 @@ func capWireBehaviour(t *testing.T, workload *promtest.BulkWorkload, srv *promte
 	// there is nothing else to detect it by.
 	var fullMeta map[string]json.RawMessage
 	promAPI(t, srv, "/api/v1/metadata", nil, &fullMeta)
-	// The fixture size is derived from MaxUpstreamMetadata, and the two caps are
-	// only coincidentally equal. Raise MaxUpstreamSeries above the fixture and
-	// the series half stops being able to fire; without this guard the failure
-	// blames truncation rather than the fixture.
-	if len(fullMeta) <= MaxUpstreamSeries {
-		t.Fatalf("prometheus knows %d metrics, want more than MaxUpstreamSeries (%d) or the series cap cannot fire", len(fullMeta), MaxUpstreamSeries)
-	}
-	if len(fullMeta) <= MaxUpstreamMetadata {
-		t.Fatalf("prometheus knows %d metrics, want more than MaxUpstreamMetadata (%d) or the cap cannot fire", len(fullMeta), MaxUpstreamMetadata)
-	}
 	var cappedMeta map[string]json.RawMessage
 	metaWarnings := promAPI(t, srv, "/api/v1/metadata",
 		url.Values{"limit": {strconv.Itoa(MaxUpstreamMetadata)}}, &cappedMeta)
