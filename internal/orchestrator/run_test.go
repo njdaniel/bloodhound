@@ -1345,3 +1345,55 @@ func TestCrashLoopStillChargesEveryAttemptThatRan(t *testing.T) {
 		t.Fatalf("only %d attempt(s) ran before convergence; the fixture proves nothing about accumulation", len(recorded))
 	}
 }
+
+// TestSpendFooterAndCostReportEveryPhase pins that scoping the hound's budget
+// and the ledger fix leave the *reporting* path whole: Result.Spend, the spend
+// the reporter renders into its footer, and `bloodhound cost` all carry the
+// case total across every phase, not just investigate.
+func TestSpendFooterAndCostReportEveryPhase(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(root, caseID)
+
+	var footer Spend
+	h := &fakeHound{finding: cannedFinding(), spend: cannedSpend()}
+	// Intake 7s, investigate 5s, report 3s: every phase contributes wall clock.
+	res, err := newTest(t, root, h, func(opts *Options) {
+		opts.Now = phaseClock(0, 7*time.Second, 0, 5*time.Second, 0, 0, 3*time.Second)
+		opts.Report = func(ctx context.Context, in ReportInput) ([]Artifact, error) {
+			footer = in.Spend
+			return fixedReport(ctx, in)
+		}
+	}).Hunt(t.Context(), alert)
+	if err != nil {
+		t.Fatalf("Hunt: %v", err)
+	}
+
+	cps := readCheckpoints(t, caseDir)
+	wantWallMS(t, cps, PhaseIntake, 7*time.Second)
+	wantWallMS(t, cps, PhaseInvestigate, 5*time.Second)
+	wantWallMS(t, cps, PhaseReport, 3*time.Second)
+
+	sum := SumSpend(cps)
+	if want := (15 * time.Second).Milliseconds(); sum.WallMS != want {
+		t.Errorf("checkpoint sum wall clock = %dms, want %dms (7s + 5s + 3s)", sum.WallMS, want)
+	}
+	if res.Spend != sum {
+		t.Errorf("Result.Spend = %+v, want the checkpoint sum %+v", res.Spend, sum)
+	}
+	// The footer is rendered from inside the report phase, before its own
+	// checkpoint exists, so it carries every phase that had finished by then.
+	if want := (12 * time.Second).Milliseconds(); footer.WallMS != want {
+		t.Errorf("report spend footer wall clock = %dms, want %dms (intake 7s + investigate 5s)", footer.WallMS, want)
+	}
+	if footer.Tokens() != cannedSpend().Tokens() || footer.ToolCalls != cannedSpend().ToolCalls {
+		t.Errorf("report spend footer = %+v, want the hound's tokens and tool calls", footer)
+	}
+	if _, costCPs, cost, err := Cost(root, caseID); err != nil {
+		t.Fatalf("Cost: %v", err)
+	} else if cost != sum || len(costCPs) != len(cps) {
+		t.Errorf("bloodhound cost = %+v over %d checkpoints, want %+v over %d",
+			cost, len(costCPs), sum, len(cps))
+	}
+}
