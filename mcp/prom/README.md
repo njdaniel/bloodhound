@@ -223,5 +223,7 @@ mean "not fetched" rather than "not registered".
   is driven over stdio against a real Prometheus container scraping a
   test-owned `/metrics` endpoint, to catch wire-format drift the fake cannot.
   CI runs it in its own job on every PR — no API key, no paid calls. The build
-  tag keeps `make check` from compiling these files at all, which is what keeps
-  it to seconds; without docker they skip rather than fail.
+  tag keeps `make check`'s build, vet and test steps from touching these files,
+  which is what keeps it to seconds; `make lint` does still analyse them, since
+  `.golangci.yml` sets `build-tags: [integration]`. Without docker they skip
+  rather than fail.
