@@ -368,6 +368,28 @@ from day one.
   resumable (§4.3) once the cause is fixed.
 - `failed` is terminal for the process but not for the case ID.
 
+**CLI exit codes.** The split is refusal versus fault, and it is the contract an
+operator wrapper keys on (issues #24, #45).
+
+- **0** — success.
+- **2, a refusal.** The CLI declined the command or its inputs; rerunning it
+  unchanged fails identically, every time, so a wrapper must stop rather than
+  retry. The set is closed: a bad invocation (including an empty `--work`), a
+  command this binary does not implement yet (`serve`, `replay` — §6), an
+  unusable alert file, a case whose recorded pipeline version is not the one
+  this binary walks (§4.3), a case ID with no case under the work root, and a
+  case whose `case.json` or checkpoints this binary cannot decode. Refused does
+  not mean nothing happened: a bad alert file deliberately leaves a resumable
+  case (§4.3).
+- **1, a fault.** The command tried its work and something under it failed.
+  Two shapes only: a phase ran and failed — which writes a `failed` checkpoint
+  and leaves the case resumable, `ErrBudgetExhausted` being the clean case where
+  raising `--max-tokens` and resuming completes it — or an I/O fault against the
+  work dir or stdout, which can fail before any case exists. So exit 1 does not
+  on its own promise something to resume; what it promises is that the failure
+  is contingent on something that can change without a different command or a
+  different binary.
+
 Phase contents in M1: **intake** parses one Alertmanager-format alert JSON
 into `Case`, assigns the case ID (`c-<utc yyyymmddThhmmss>-<6 hex crypto/rand>`),
 creates the work dir. **investigate** runs metrics-hound (§3). **report**
@@ -531,8 +553,10 @@ container test is a smoke check; nothing in CI's default path calls a paid API.
 - `hunt --alert fixture.json` with scripted provider + fake Prometheus:
   exit 0, work dir complete, `report.json` matches golden.
 - `hunt --resume` on the kill-mid-investigate work dir (the §4.3 acceptance
-  test). Exit codes: bad alert file 2, pipeline-version mismatch on resume 2,
-  phase failure 1.
+  test). Exit codes per §4.1: bad alert file 2, pipeline-version mismatch on
+  resume 2, an unknown or undecodable case on resume or `cost` 2, `serve` and
+  `replay` before M2 2, an empty `--work` 2; phase failure 1, with exit 1's
+  promise re-checked against every path that still lands there.
 
 **Live demo (manual, documented in the PR, not CI):** kind cluster + Prometheus
 scraping it; break a pod manually (bad image or CPU-starved limits); craft the

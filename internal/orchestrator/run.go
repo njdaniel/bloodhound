@@ -30,13 +30,47 @@ const (
 
 // ErrBadAlert marks a case that cannot start because its alert file is
 // missing, unreadable, or not a usable Alertmanager alert. The CLI maps it to
-// exit code 2, as it does ErrPipelineMismatch; every other phase failure is
-// exit 1.
+// exit code 2 — a refusal, since rerunning against the same file fails
+// identically.
+//
+// It is the one refusal that still leaves a resumable case: Hunt creates the
+// work dir before intake reads the file, on purpose, so the operator fixes the
+// file and resumes rather than starting over (spec 002 §4.3). Exit 2 therefore
+// does not mean "nothing happened", and nothing in the CLI's contract may say
+// that it does.
 var ErrBadAlert = errors.New("orchestrator: unusable alert file")
+
+// ErrNoSuchCase reports that the work root holds no case with the given ID:
+// `--resume c-typo` or `cost c-typo`. Nothing ran and nothing was written, and
+// rerunning the same command finds the same absence — the ID itself is what has
+// to change. The CLI maps it to exit code 2 for that reason (issue #45).
+//
+// It is deliberately distinct from ErrCorruptCase: both are refusals, but they
+// tell an operator to do different things. This one means "you named the wrong
+// case"; the other means "the case you named is damaged".
+var ErrNoSuchCase = errors.New("orchestrator: no such case")
+
+// ErrCorruptCase reports that a case's on-disk state exists but this binary
+// cannot decode it: case.json is not valid JSON, a checkpoint file is not valid
+// JSON or does not carry a supported schema_version, or a checkpoint filename
+// has no walk index. The bytes will not decode differently on the next attempt,
+// so the CLI maps it to exit code 2 (issue #45): a wrapper that retried exit 1
+// would loop forever on a work dir truncated by a full disk.
+//
+// The case may still be recoverable by hand — repairing or deleting the
+// offending file is an operator action outside this binary — but nothing this
+// command does can get past it.
+var ErrCorruptCase = errors.New("orchestrator: case state is not decodable")
 
 // ErrBudgetExhausted reports that spend already recorded in this case's
 // checkpoints for the phase about to run leaves it no budget. It is what stops
 // a crash loop from multiplying cost across resumes (spec 002 §4.3).
+//
+// It is the exit-1 member whose promise reads true without qualification: the
+// phase was refused, but the refusal is written as a failed checkpoint, so the
+// case is on disk and raising --max-tokens and resuming completes it. Issue #45
+// moved several paths off exit 1 for lacking exactly that property; this one
+// keeps it, and the CLI's exit-1 contract is written around it.
 var ErrBudgetExhausted = errors.New("orchestrator: budget exhausted by prior attempts")
 
 // ErrPipelineMismatch reports that the case being resumed records a different
@@ -367,12 +401,17 @@ func (o *Orchestrator) run(ctx context.Context, r *run) (Result, error) {
 
 // adopt deserializes a completed checkpoint's output as that phase's result,
 // so a resumed walk continues with the same state the original run had.
+//
+// An output that does not decode as its phase's type is ErrCorruptCase, the
+// same permanent refusal an undecodable checkpoint file is: the checkpoint is
+// only ever rewritten by re-running the phase, and a completed phase is never
+// re-run, so retrying reads the same bytes forever (issue #45).
 func (r *run) adopt(phase Phase, cp Checkpoint) error {
 	switch phase {
 	case PhaseIntake:
 		var c Case
 		if err := json.Unmarshal(cp.Output, &c); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrCorruptCase, err)
 		}
 		r.c.AlertName = c.AlertName
 		r.c.Labels = c.Labels
@@ -383,13 +422,13 @@ func (r *run) adopt(phase Phase, cp Checkpoint) error {
 	case PhaseInvestigate:
 		var f Finding
 		if err := json.Unmarshal(cp.Output, &f); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrCorruptCase, err)
 		}
 		r.finding = f
 	case PhaseReport:
 		var out ReportOutput
 		if err := json.Unmarshal(cp.Output, &out); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrCorruptCase, err)
 		}
 		r.artifacts = out.Artifacts
 	default:

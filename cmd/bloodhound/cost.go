@@ -11,11 +11,20 @@ import (
 // cost prints what a case spent, per phase and in total. The numbers come from
 // summing the case's checkpoints — there is no separate ledger to drift out of
 // step with them (spec 002 §4.2).
+//
+// It runs no phase and writes nothing, so it can only ever exit 0, 2, or the
+// I/O-fault half of 1: a bad invocation, an unknown case, and an undecodable
+// one are all refusals it inherits from the readers it calls, and the only
+// faults left are a case file it may not read and a stdout it cannot write
+// (issue #45). It needs no exit-code rule of its own.
 func (a *app) cost(args []string) error {
 	fs := a.newFlagSet("cost")
 	work := fs.String("work", a.envOr("BLOODHOUND_WORK", DefaultWorkRoot), "work root directory")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("%w: %w", errUsage, err)
+	}
+	if err := checkWorkRoot(*work); err != nil {
+		return err
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("%w: cost needs exactly one case ID", errUsage)

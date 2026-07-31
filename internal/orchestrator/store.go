@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,7 +60,12 @@ func newStore(dir string, rename func(oldpath, newpath string) error) (*store, e
 // something to paper over by creating an empty dir.
 func openStore(dir string, rename func(oldpath, newpath string) error) (*store, error) {
 	info, err := os.Stat(dir)
-	if err != nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Resume reads case.json first, so reaching this means the dir went
+		// away between the two calls. It is still an absent case, not a fault.
+		return nil, fmt.Errorf("opening case work dir: %w: %s", ErrNoSuchCase, dir)
+	case err != nil:
 		return nil, fmt.Errorf("opening case work dir: %w", err)
 	}
 	if !info.IsDir() {
@@ -101,14 +107,23 @@ func (s *store) writeCase(c Case) error { return s.writeJSON(CaseFile, c) }
 // ReadCase loads the case file from a case work dir. It is the read-only door
 // into a work dir: it creates nothing, so inspection commands cannot leave
 // half-formed cases behind.
+//
+// The two ways it fails are reported apart, because they ask an operator for
+// different fixes (issue #45): a case file that is not there is ErrNoSuchCase —
+// the ID is wrong — while one that is there and does not decode is
+// ErrCorruptCase. Any other read fault (a permission denial, a failing disk) is
+// an environment fault and is returned unclassified, so it keeps exit 1.
 func ReadCase(caseDir string) (Case, error) {
 	data, err := os.ReadFile(filepath.Join(caseDir, CaseFile))
-	if err != nil {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return Case{}, fmt.Errorf("reading %s: %w: %s", CaseFile, ErrNoSuchCase, caseDir)
+	case err != nil:
 		return Case{}, fmt.Errorf("reading %s: %w", CaseFile, err)
 	}
 	var c Case
 	if err := json.Unmarshal(data, &c); err != nil {
-		return Case{}, fmt.Errorf("decoding %s: %w", CaseFile, err)
+		return Case{}, fmt.Errorf("decoding %s: %w: %w", CaseFile, ErrCorruptCase, err)
 	}
 	return c, nil
 }

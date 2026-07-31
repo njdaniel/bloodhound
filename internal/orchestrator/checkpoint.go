@@ -72,6 +72,13 @@ func checkpointName(index int, phase Phase) string {
 // LoadCheckpoints reads every checkpoint in caseDir/checkpoints, ordered by
 // the leading sequence number in the filename. It is the reader behind both
 // resume and `bloodhound cost`.
+//
+// A checkpoint that does not decode, does not carry a supported schema version,
+// or is not named with a walk index is ErrCorruptCase: it is the same permanent
+// refusal an undecodable case.json is, and the CLI must report it the same way
+// or a wrapper retrying exit 1 loops on it forever (issue #45). A missing
+// checkpoint dir is not corruption — a case can legitimately have no
+// checkpoints yet — and reports no checkpoints and no error.
 func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 	dir := filepath.Join(caseDir, checkpointDir)
 	entries, err := os.ReadDir(dir)
@@ -93,7 +100,7 @@ func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 		}
 		seq, err := checkpointSeq(e.Name())
 		if err != nil {
-			return nil, fmt.Errorf("checkpoint %s: %w", e.Name(), err)
+			return nil, fmt.Errorf("checkpoint %s: %w: %w", e.Name(), ErrCorruptCase, err)
 		}
 		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
@@ -101,11 +108,11 @@ func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 		}
 		var cp Checkpoint
 		if err := json.Unmarshal(data, &cp); err != nil {
-			return nil, fmt.Errorf("decoding checkpoint %s: %w", e.Name(), err)
+			return nil, fmt.Errorf("decoding checkpoint %s: %w: %w", e.Name(), ErrCorruptCase, err)
 		}
 		if cp.SchemaVersion != CheckpointSchemaVersion {
-			return nil, fmt.Errorf("checkpoint %s: schema_version %d is not supported (want %d)",
-				e.Name(), cp.SchemaVersion, CheckpointSchemaVersion)
+			return nil, fmt.Errorf("checkpoint %s: %w: schema_version %d is not supported (want %d)",
+				e.Name(), ErrCorruptCase, cp.SchemaVersion, CheckpointSchemaVersion)
 		}
 		found = append(found, numbered{seq: seq, cp: cp})
 	}

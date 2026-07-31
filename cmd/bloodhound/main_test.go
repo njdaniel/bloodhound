@@ -83,10 +83,15 @@ func TestExitCodes(t *testing.T) {
 		{name: "missing alert file", args: []string{"hunt", "--work", work, "--alert", filepath.Join(work, "nope.json")}, want: 2},
 		{name: "unusable alert file", args: []string{"hunt", "--work", work, "--alert", badAlert}, want: 2},
 		{name: "cost with no case", args: []string{"cost"}, want: 2},
-		{name: "cost for an unknown case", args: []string{"cost", "--work", work, "c-nope"}, want: 1},
-		{name: "resume an unknown case", args: []string{"hunt", "--work", work, "--resume", "c-nope"}, want: 1},
-		{name: "serve is M2", args: []string{"serve"}, want: 1},
-		{name: "replay is M2", args: []string{"replay", "c-1"}, want: 1},
+		// The five below changed from want: 1 in issue #45. Each is a refusal
+		// the CLI used to report as a fault, so a wrapper retrying exit 1
+		// looped on a command that could not succeed. The dedicated tests
+		// under this one carry the reasoning per path.
+		{name: "cost for an unknown case", args: []string{"cost", "--work", work, "c-nope"}, want: 2},
+		{name: "resume an unknown case", args: []string{"hunt", "--work", work, "--resume", "c-nope"}, want: 2},
+		{name: "hunt with an empty work root", args: []string{"hunt", "--work", "", "--alert", badAlert}, want: 2},
+		{name: "serve is M2", args: []string{"serve"}, want: 2},
+		{name: "replay is M2", args: []string{"replay", "c-1"}, want: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,6 +176,195 @@ func TestPipelineMismatchResumeExitsTwo(t *testing.T) {
 	}
 	if !bytes.Equal(after, before) {
 		t.Errorf("case file changed on a refused resume:\n--- got ---\n%s\n--- want ---\n%s", after, before)
+	}
+}
+
+// TestUnimplementedCommandsExitTwo pins the purest recurrence of issue #24:
+// serve and replay do not exist until M2, so a wrapper that retries exit 1
+// would retry them for a whole milestone. Nothing ran and nothing was written,
+// and no rerun of this binary can change that — only a newer binary can.
+func TestUnimplementedCommandsExitTwo(t *testing.T) {
+	for _, args := range [][]string{{"serve"}, {"replay", "c-1"}} {
+		t.Run(args[0], func(t *testing.T) {
+			a, stdout, _ := stubApp(t)
+			err := a.run(t.Context(), args)
+			if !errors.Is(err, errNotImplemented) {
+				t.Fatalf("error = %v, want errNotImplemented", err)
+			}
+			if got := exitCode(err); got != 2 {
+				t.Errorf("exit code = %d, want 2; exit 1 is the fault arm and this command cannot succeed until M2", got)
+			}
+			// Not errUsage: the invocation is right, it is just early. A
+			// wrapper reading stderr must not be told to fix the command.
+			if errors.Is(err, errUsage) {
+				t.Error("an unimplemented command reported itself as a bad invocation")
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing written", stdout)
+			}
+		})
+	}
+}
+
+// TestEmptyWorkRootExitsTwo pins the --work "" arm. It is a bad invocation
+// caught by orchestrator.New, which returned an ordinary error and so fell out
+// as exit 1 before issue #45. cost is checked too: without the CLI-side check
+// it resolves the case dir against the process cwd instead of refusing.
+func TestEmptyWorkRootExitsTwo(t *testing.T) {
+	alert := filepath.Join(t.TempDir(), "alert.json")
+	if err := os.WriteFile(alert, []byte(`{"alerts":[]}`), 0o644); err != nil {
+		t.Fatalf("writing alert: %v", err)
+	}
+	cmds := map[string][]string{
+		"hunt": {"hunt", "--work", "", "--alert", alert},
+		"cost": {"cost", "--work", "", "c-1"},
+	}
+	for name, args := range cmds {
+		t.Run(name, func(t *testing.T) {
+			a, _, _ := stubApp(t)
+			err := a.run(t.Context(), args)
+			if !errors.Is(err, errUsage) {
+				t.Fatalf("error = %v, want errUsage", err)
+			}
+			if got := exitCode(err); got != 2 {
+				t.Errorf("exit code = %d, want 2; an empty --work is a bad invocation, not a fault", got)
+			}
+		})
+	}
+}
+
+// TestMissingCaseExitsTwo pins the "no such case" half of the resume/cost
+// decision (issue #45): a typo'd case ID is fix-and-retry, which is exit 2's
+// contract — the ID has to change, and rerunning as-is finds the same absence
+// forever. It must report ErrNoSuchCase and not ErrCorruptCase, because the two
+// tell an operator to do different things.
+func TestMissingCaseExitsTwo(t *testing.T) {
+	work := t.TempDir()
+	cmds := map[string][]string{
+		"resume": {"hunt", "--work", work, "--resume", "c-nope"},
+		"cost":   {"cost", "--work", work, "c-nope"},
+	}
+	for name, args := range cmds {
+		t.Run(name, func(t *testing.T) {
+			a, _, _ := stubApp(t)
+			err := a.run(t.Context(), args)
+			if !errors.Is(err, orchestrator.ErrNoSuchCase) {
+				t.Fatalf("error = %v, want ErrNoSuchCase", err)
+			}
+			if errors.Is(err, orchestrator.ErrCorruptCase) {
+				t.Error("an absent case reported itself as corrupt; the two need different operator actions")
+			}
+			if got := exitCode(err); got != 2 {
+				t.Errorf("exit code = %d, want 2; there is no case, so there is nothing a retry could resume", got)
+			}
+		})
+	}
+}
+
+// TestCorruptCaseExitsTwo pins the other half: on-disk state this binary cannot
+// decode. The bytes do not change between attempts, so exit 1 would loop a
+// retrying wrapper forever on a work dir truncated by a full disk — the exact
+// failure PR #40 predicted and deferred. Every form of undecodable state counts,
+// not just case.json: a corrupt checkpoint is reached through the same commands
+// and is just as permanent.
+func TestCorruptCaseExitsTwo(t *testing.T) {
+	const caseJSON = `{"id":"c-x","phase":"investigate","work_dir":"","pipeline":"v0"}`
+	corruptions := map[string]struct{ caseFile, cpName, cpBody string }{
+		"undecodable case.json": {caseFile: `{ not json`},
+		"undecodable checkpoint": {
+			caseFile: caseJSON, cpName: "01-intake.json", cpBody: `{ not json`,
+		},
+		"unsupported checkpoint schema": {
+			caseFile: caseJSON, cpName: "01-intake.json",
+			cpBody: `{"schema_version":99,"phase":"intake","status":"completed","output":null}`,
+		},
+		"checkpoint with no walk index": {
+			caseFile: caseJSON, cpName: "intake.json",
+			cpBody: `{"schema_version":1,"phase":"intake","status":"completed","output":null}`,
+		},
+	}
+	for name, c := range corruptions {
+		t.Run(name, func(t *testing.T) {
+			work := t.TempDir()
+			caseID := "c-x"
+			caseDir := filepath.Join(work, caseID)
+			if err := os.MkdirAll(filepath.Join(caseDir, "checkpoints"), 0o755); err != nil {
+				t.Fatalf("creating case dir: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(caseDir, orchestrator.CaseFile), []byte(c.caseFile), 0o644); err != nil {
+				t.Fatalf("writing case file: %v", err)
+			}
+			if c.cpName != "" {
+				path := filepath.Join(caseDir, "checkpoints", c.cpName)
+				if err := os.WriteFile(path, []byte(c.cpBody), 0o644); err != nil {
+					t.Fatalf("writing checkpoint: %v", err)
+				}
+			}
+			cmds := map[string][]string{
+				"resume": {"hunt", "--work", work, "--resume", caseID},
+				"cost":   {"cost", "--work", work, caseID},
+			}
+			for cmd, args := range cmds {
+				t.Run(cmd, func(t *testing.T) {
+					a, _, _ := stubApp(t)
+					err := a.run(t.Context(), args)
+					if !errors.Is(err, orchestrator.ErrCorruptCase) {
+						t.Fatalf("error = %v, want ErrCorruptCase", err)
+					}
+					if errors.Is(err, orchestrator.ErrNoSuchCase) {
+						t.Error("a corrupt case reported itself as absent; the case is there, it is damaged")
+					}
+					if got := exitCode(err); got != 2 {
+						t.Errorf("exit code = %d, want 2; these bytes will not decode on any retry", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestPhaseFailureStillExitsOneAndLeavesAResumableCase is the other side of the
+// #45 reclassification: after moving five refusals to exit 2, exit 1 must still
+// have a member, and its documented promise — a failed phase leaves a resumable
+// case — must still hold for it. ErrBudgetExhausted is that member: the phase
+// was refused for budget, the case is checkpointed as failed, and raising
+// --max-tokens and resuming completes it. A change that flattened everything
+// into exit 2 would fail here.
+func TestPhaseFailureStillExitsOneAndLeavesAResumableCase(t *testing.T) {
+	work := t.TempDir()
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(work, caseID)
+	writeCaseFixture(t, caseDir, caseID)
+
+	// Rewind the case to investigate: intake keeps its completed checkpoint, so
+	// resume adopts it rather than re-running it, and investigate re-runs
+	// against a budget its own failed attempt has already used up.
+	c := readCase(t, caseDir)
+	c.Phase = orchestrator.PhaseInvestigate
+	writeJSONFixture(t, filepath.Join(caseDir, orchestrator.CaseFile), c)
+	if err := os.Remove(filepath.Join(caseDir, "checkpoints", "03-report.json")); err != nil {
+		t.Fatalf("removing report checkpoint: %v", err)
+	}
+	writeJSONFixture(t, filepath.Join(caseDir, "checkpoints", "02-investigate.json"), orchestrator.Checkpoint{
+		SchemaVersion: orchestrator.CheckpointSchemaVersion,
+		CaseID:        caseID,
+		Phase:         orchestrator.PhaseInvestigate,
+		Status:        orchestrator.StatusFailed,
+		Spend:         orchestrator.Spend{InputTokens: 900},
+		Output:        json.RawMessage("null"),
+	})
+
+	a, _, _ := stubApp(t)
+	err := a.run(t.Context(), []string{"hunt", "--work", work, "--resume", caseID, "--max-tokens", "100"})
+	if !errors.Is(err, orchestrator.ErrBudgetExhausted) {
+		t.Fatalf("error = %v, want ErrBudgetExhausted", err)
+	}
+	if got := exitCode(err); got != 1 {
+		t.Fatalf("exit code = %d, want 1; a failed phase is a fault, and this case is resumable", got)
+	}
+	// The promise exit 1 makes: there is a case on disk to resume.
+	if got := readCase(t, caseDir); got.Phase != orchestrator.PhaseFailed {
+		t.Errorf("case phase = %q, want %q — exit 1 promises a resumable case", got.Phase, orchestrator.PhaseFailed)
 	}
 }
 
