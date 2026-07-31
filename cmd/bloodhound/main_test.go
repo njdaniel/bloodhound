@@ -66,6 +66,12 @@ func TestExitCodes(t *testing.T) {
 	if err := os.WriteFile(badAlert, []byte(`{"alerts":[]}`), 0o644); err != nil {
 		t.Fatalf("writing bad alert: %v", err)
 	}
+	// A work root that is a regular file: the case dir cannot be created, which
+	// is the I/O-fault shape of exit 1 — the half with no case to resume.
+	notADir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatalf("writing the not-a-directory work root: %v", err)
+	}
 
 	tests := []struct {
 		name string
@@ -83,15 +89,22 @@ func TestExitCodes(t *testing.T) {
 		{name: "missing alert file", args: []string{"hunt", "--work", work, "--alert", filepath.Join(work, "nope.json")}, want: 2},
 		{name: "unusable alert file", args: []string{"hunt", "--work", work, "--alert", badAlert}, want: 2},
 		{name: "cost with no case", args: []string{"cost"}, want: 2},
-		// The five below changed from want: 1 in issue #45. Each is a refusal
-		// the CLI used to report as a fault, so a wrapper retrying exit 1
-		// looped on a command that could not succeed. The dedicated tests
-		// under this one carry the reasoning per path.
+		// Four of the five below changed from want: 1 in issue #45; the empty
+		// work root is a new row. Each is a refusal the CLI used to report as a
+		// fault, so a wrapper retrying exit 1 looped on a command that could not
+		// succeed. The dedicated tests under this one carry the per-path
+		// reasoning. (The empty --work row is new because cost never exited 1
+		// for it — it exited 2 via ErrNoSuchCase, or 0 against the wrong case;
+		// see checkWorkRoot.)
 		{name: "cost for an unknown case", args: []string{"cost", "--work", work, "c-nope"}, want: 2},
 		{name: "resume an unknown case", args: []string{"hunt", "--work", work, "--resume", "c-nope"}, want: 2},
 		{name: "hunt with an empty work root", args: []string{"hunt", "--work", "", "--alert", badAlert}, want: 2},
 		{name: "serve is M2", args: []string{"serve"}, want: 2},
 		{name: "replay is M2", args: []string{"replay", "c-1"}, want: 2},
+		// Exit 1's I/O-fault shape. Without this row the table has no want: 1
+		// at all, and a change that swept the whole default arm into 2 would
+		// still pass every other exit-code test here.
+		{name: "work root is not a directory", args: []string{"hunt", "--work", notADir, "--alert", badAlert}, want: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -206,10 +219,12 @@ func TestUnimplementedCommandsExitTwo(t *testing.T) {
 	}
 }
 
-// TestEmptyWorkRootExitsTwo pins the --work "" arm. It is a bad invocation
-// caught by orchestrator.New, which returned an ordinary error and so fell out
-// as exit 1 before issue #45. cost is checked too: without the CLI-side check
-// it resolves the case dir against the process cwd instead of refusing.
+// TestEmptyWorkRootExitsTwo pins the --work "" arm for both commands, which
+// were broken differently (issue #45). hunt reached orchestrator.New, whose
+// ordinary error fell out as exit 1. cost never calls New at all: it already
+// exited 2, via ErrNoSuchCase, having resolved the case against the process cwd
+// — and would have exited 0 with another case's numbers if the cwd held one. So
+// this pins an exit-code fix for hunt and a correctness fix for cost.
 func TestEmptyWorkRootExitsTwo(t *testing.T) {
 	alert := filepath.Join(t.TempDir(), "alert.json")
 	if err := os.WriteFile(alert, []byte(`{"alerts":[]}`), 0o644); err != nil {
@@ -236,7 +251,7 @@ func TestEmptyWorkRootExitsTwo(t *testing.T) {
 // TestMissingCaseExitsTwo pins the "no such case" half of the resume/cost
 // decision (issue #45): a typo'd case ID is fix-and-retry, which is exit 2's
 // contract — the ID has to change, and rerunning as-is finds the same absence
-// forever. It must report ErrNoSuchCase and not ErrCorruptCase, because the two
+// forever. It must report ErrNoSuchCase and not ErrUnusableCase, because the two
 // tell an operator to do different things.
 func TestMissingCaseExitsTwo(t *testing.T) {
 	work := t.TempDir()
@@ -251,8 +266,8 @@ func TestMissingCaseExitsTwo(t *testing.T) {
 			if !errors.Is(err, orchestrator.ErrNoSuchCase) {
 				t.Fatalf("error = %v, want ErrNoSuchCase", err)
 			}
-			if errors.Is(err, orchestrator.ErrCorruptCase) {
-				t.Error("an absent case reported itself as corrupt; the two need different operator actions")
+			if errors.Is(err, orchestrator.ErrUnusableCase) {
+				t.Error("an absent case reported itself as unusable; the two need different operator actions")
 			}
 			if got := exitCode(err); got != 2 {
 				t.Errorf("exit code = %d, want 2; there is no case, so there is nothing a retry could resume", got)
@@ -261,29 +276,38 @@ func TestMissingCaseExitsTwo(t *testing.T) {
 	}
 }
 
-// TestCorruptCaseExitsTwo pins the other half: on-disk state this binary cannot
-// decode. The bytes do not change between attempts, so exit 1 would loop a
+// TestUnusableCaseExitsTwo pins the other half: recorded state this binary
+// cannot read as written. Rereading it changes nothing, so exit 1 would loop a
 // retrying wrapper forever on a work dir truncated by a full disk — the exact
-// failure PR #40 predicted and deferred. Every form of undecodable state counts,
-// not just case.json: a corrupt checkpoint is reached through the same commands
-// and is just as permanent.
-func TestCorruptCaseExitsTwo(t *testing.T) {
+// failure PR #40 predicted and deferred. Every form counts, not just case.json:
+// a checkpoint is reached through the same commands and is just as permanent.
+//
+// wantMessage guards the half of this that is not the exit code. Two of the four
+// causes are not damage — a checkpoint from a newer binary, and a foreign file
+// someone dropped in checkpoints/ — and telling an operator their case is
+// corrupt would get a healthy case deleted. Each message must name its own cause.
+func TestUnusableCaseExitsTwo(t *testing.T) {
 	const caseJSON = `{"id":"c-x","phase":"investigate","work_dir":"","pipeline":"v0"}`
-	corruptions := map[string]struct{ caseFile, cpName, cpBody string }{
-		"undecodable case.json": {caseFile: `{ not json`},
+	unusable := map[string]struct{ caseFile, cpName, cpBody, wantMessage string }{
+		"undecodable case.json": {
+			caseFile: `{ not json`, wantMessage: "decoding case.json",
+		},
 		"undecodable checkpoint": {
 			caseFile: caseJSON, cpName: "01-intake.json", cpBody: `{ not json`,
+			wantMessage: "decoding checkpoint 01-intake.json",
 		},
 		"unsupported checkpoint schema": {
 			caseFile: caseJSON, cpName: "01-intake.json",
-			cpBody: `{"schema_version":99,"phase":"intake","status":"completed","output":null}`,
+			cpBody:      `{"schema_version":99,"phase":"intake","status":"completed","output":null}`,
+			wantMessage: "version skew",
 		},
 		"checkpoint with no walk index": {
 			caseFile: caseJSON, cpName: "intake.json",
-			cpBody: `{"schema_version":1,"phase":"intake","status":"completed","output":null}`,
+			cpBody:      `{"schema_version":1,"phase":"intake","status":"completed","output":null}`,
+			wantMessage: "this binary did not write it",
 		},
 	}
-	for name, c := range corruptions {
+	for name, c := range unusable {
 		t.Run(name, func(t *testing.T) {
 			work := t.TempDir()
 			caseID := "c-x"
@@ -308,14 +332,17 @@ func TestCorruptCaseExitsTwo(t *testing.T) {
 				t.Run(cmd, func(t *testing.T) {
 					a, _, _ := stubApp(t)
 					err := a.run(t.Context(), args)
-					if !errors.Is(err, orchestrator.ErrCorruptCase) {
-						t.Fatalf("error = %v, want ErrCorruptCase", err)
+					if !errors.Is(err, orchestrator.ErrUnusableCase) {
+						t.Fatalf("error = %v, want ErrUnusableCase", err)
 					}
 					if errors.Is(err, orchestrator.ErrNoSuchCase) {
-						t.Error("a corrupt case reported itself as absent; the case is there, it is damaged")
+						t.Error("an unusable case reported itself as absent; the case is there, this binary just cannot read it")
 					}
 					if got := exitCode(err); got != 2 {
-						t.Errorf("exit code = %d, want 2; these bytes will not decode on any retry", got)
+						t.Errorf("exit code = %d, want 2; rereading these bytes changes nothing", got)
+					}
+					if !strings.Contains(err.Error(), c.wantMessage) {
+						t.Errorf("message does not name this cause; it must not be diagnosed as damage when it is not:\n got: %v\nwant it to contain: %q", err, c.wantMessage)
 					}
 				})
 			}

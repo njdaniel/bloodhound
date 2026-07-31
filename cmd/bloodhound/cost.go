@@ -13,10 +13,12 @@ import (
 // step with them (spec 002 §4.2).
 //
 // It runs no phase and writes nothing, so it can only ever exit 0, 2, or the
-// I/O-fault half of 1: a bad invocation, an unknown case, and an undecodable
-// one are all refusals it inherits from the readers it calls, and the only
-// faults left are a case file it may not read and a stdout it cannot write
-// (issue #45). It needs no exit-code rule of its own.
+// I/O-fault half of 1 (issue #45). A bad invocation, an unknown case, and one
+// this binary cannot read are all refusals it inherits from the readers it
+// calls. What is left for exit 1 is filesystem faults: a case file or a
+// checkpoint file it may not read, an ENOTDIR from a --work root or a case dir
+// that is a regular file, and a stdout it cannot write. Exit 1's own
+// description covers those, so cost needs no exit-code rule of its own.
 func (a *app) cost(args []string) error {
 	fs := a.newFlagSet("cost")
 	work := fs.String("work", a.envOr("BLOODHOUND_WORK", DefaultWorkRoot), "work root directory")

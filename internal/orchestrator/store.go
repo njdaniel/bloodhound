@@ -64,7 +64,7 @@ func openStore(dir string, rename func(oldpath, newpath string) error) (*store, 
 	case errors.Is(err, os.ErrNotExist):
 		// Resume reads case.json first, so reaching this means the dir went
 		// away between the two calls. It is still an absent case, not a fault.
-		return nil, fmt.Errorf("opening case work dir: %w: %s", ErrNoSuchCase, dir)
+		return nil, fmt.Errorf("opening case work dir: %w: %w", ErrNoSuchCase, err)
 	case err != nil:
 		return nil, fmt.Errorf("opening case work dir: %w", err)
 	}
@@ -111,19 +111,22 @@ func (s *store) writeCase(c Case) error { return s.writeJSON(CaseFile, c) }
 // The two ways it fails are reported apart, because they ask an operator for
 // different fixes (issue #45): a case file that is not there is ErrNoSuchCase —
 // the ID is wrong — while one that is there and does not decode is
-// ErrCorruptCase. Any other read fault (a permission denial, a failing disk) is
-// an environment fault and is returned unclassified, so it keeps exit 1.
+// ErrUnusableCase. Any other read fault (a permission denial, a failing disk) is
+// returned unclassified, so it keeps exit 1. That is not a claim that such a
+// fault is transient — a case file owned by root is as permanent as damage. It
+// is that this binary cannot tell which, and exit 1 is the arm for what it
+// cannot classify; see the CLI's exitCode.
 func ReadCase(caseDir string) (Case, error) {
 	data, err := os.ReadFile(filepath.Join(caseDir, CaseFile))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return Case{}, fmt.Errorf("reading %s: %w: %s", CaseFile, ErrNoSuchCase, caseDir)
+		return Case{}, fmt.Errorf("reading %s: %w: %w", CaseFile, ErrNoSuchCase, err)
 	case err != nil:
 		return Case{}, fmt.Errorf("reading %s: %w", CaseFile, err)
 	}
 	var c Case
 	if err := json.Unmarshal(data, &c); err != nil {
-		return Case{}, fmt.Errorf("decoding %s: %w: %w", CaseFile, ErrCorruptCase, err)
+		return Case{}, fmt.Errorf("decoding %s: %w: %w", CaseFile, ErrUnusableCase, err)
 	}
 	return c, nil
 }

@@ -2,15 +2,16 @@
 // agent pack. See specs/001-build-spec.md for the architecture and
 // specs/002-m1-metrics-path.md §4 for the orchestrator this CLI drives.
 //
-// Exit codes split refusals from faults. 0 is success. 2 is a refusal: the CLI
-// declined the command or its inputs, and rerunning it unchanged fails
-// identically — a bad invocation, a command this binary does not implement yet
-// (serve and replay, which arrive in M2), an unusable alert file, or a case
-// that is missing, undecodable, or written by a pipeline version this binary
-// does not walk. 1 is a fault: the command tried its work and something under
-// it failed — a phase, which leaves a resumable case, or an I/O fault against
-// the work dir or stdout, which may leave nothing to resume. See exitCode for
-// the full contract and what a retrying wrapper may conclude from each.
+// Exit codes split recognized refusals from unclassified faults. 0 is success.
+// 2 is a refusal the CLI made deliberately, from a closed set: a bad
+// invocation, a command this binary does not implement yet (serve and replay,
+// which arrive in M2), an unusable alert file, or a case that is missing,
+// unreadable by this binary, or written by a pipeline version it does not walk.
+// 1 is everything else: the command tried its work and something under it
+// failed that this binary could not classify — a phase, which leaves a
+// resumable case, or an I/O fault, which may leave nothing to resume. Exit 1 is
+// not a promise that retrying helps; an unclassified fault can be as permanent
+// as a refusal. See exitCode for the full contract.
 package main
 
 import (
@@ -48,16 +49,22 @@ Environment:
 
 Exit codes:
   0  ok.
-  1  a fault: the command ran and something under it failed. A failed phase
-     leaves the case resumable once the cause is fixed — after a budget
-     failure, raise --max-tokens and --resume. An I/O fault against the work
-     dir or stdout may leave nothing to resume.
-  2  a refusal: rerunning this command unchanged fails identically. A bad
-     invocation, a command this binary does not implement yet (serve, replay
-     — M2), an unusable alert file, or a case that is missing, undecodable,
-     or written by a pipeline version this binary does not walk (a case
-     recording none is a mismatch too). A refused alert file still leaves a
-     case to resume once the file is fixed.
+  1  an unclassified fault: the command ran and something under it failed
+     that this binary could not name. Either a phase failed — which leaves
+     the case resumable once the cause is fixed, so after a budget failure
+     raise --max-tokens and --resume — or an I/O fault hit the work dir or
+     stdout, which may leave nothing to resume. Not a promise that retrying
+     helps: a work dir this process may not write is exit 1 and stays that
+     way. Retry a bounded number of times, never indefinitely.
+  2  a refusal this binary made deliberately, from a closed set: a bad
+     invocation, a command it does not implement yet (serve, replay — M2),
+     an unusable alert file, or a case that is missing, unreadable by this
+     binary, or written by a pipeline version it does not walk (a case
+     recording none is a mismatch too). Rerunning unchanged always fails
+     the same way, so stop and read the message: it says what to change.
+     "Unreadable" is not always damage — a checkpoint from a newer
+     bloodhound reports here too, and deleting the case is the wrong move.
+     A refused alert file still leaves a case to resume once it is fixed.
 `
 
 // errUsage marks an invocation the CLI refused before doing any work: no
@@ -94,43 +101,50 @@ func main() {
 // exitCode maps a command error to the process exit status. The distinction a
 // retrying wrapper keys on is refusal (2) versus fault (1).
 //
-// Exit 2 is the closed set enumerated below, and only that set: the CLI
-// declined the command or its inputs, and rerunning it unchanged fails
-// identically, every time. A wrapper must stop and surface it. The members and
-// what each tells an operator to change:
+// Exit 2 is a recognized refusal: the CLI identified the command or its inputs
+// as ones it will not act on, and said so deliberately. It is the closed set
+// enumerated below and only that set, and a wrapper must stop and surface it.
+// The members, and what each tells an operator to change:
 //
-//   - errUsage — the invocation. Includes an empty --work, which is a bad
-//     invocation that used to reach orchestrator.New and fall out as 1.
+//   - errUsage — the invocation. Includes an empty --work, which for hunt used
+//     to reach orchestrator.New and fall out as 1, and for cost was worse: see
+//     checkWorkRoot.
 //   - errNotImplemented — nothing, yet: serve and replay need an M2 binary.
 //   - orchestrator.ErrBadAlert — the alert file.
 //   - orchestrator.ErrPipelineMismatch — nothing can change it (issue #24).
 //     The orchestrator refuses that case with deliberately no migration path.
 //   - orchestrator.ErrNoSuchCase — the case ID; there is no such case.
-//   - orchestrator.ErrCorruptCase — the work dir; a case.json or checkpoint
-//     that this binary cannot decode will not decode on the next attempt.
+//   - orchestrator.ErrUnusableCase — the work dir, though not always by
+//     repairing it: only some causes are damage, and version skew is one of the
+//     others. The sentinel's own doc enumerates all five; the message says which.
 //
-// Refused does not mean nothing happened. ErrBadAlert opens the case before
-// intake reads the file, on purpose, so it is refused and still leaves a case
-// to resume once the file is fixed (spec 002 §4.3) — pinned by
+// Rerunning any of them unchanged fails identically. That is a property every
+// member has, but it is not what defines the set — see below — and it does not
+// mean nothing happened: ErrBadAlert opens the case before intake reads the
+// file, on purpose, so it is refused and still leaves a case to resume once the
+// file is fixed (spec 002 §4.3), pinned by
 // TestBadAlertFileExitsTwoButLeavesAResumableCase.
 //
-// Exit 1 is the default, and it is a fault rather than a refusal: the command
-// tried to do its work and something under it failed. Exactly two shapes reach
-// it (issue #45), and they differ in what they leave behind:
+// Exit 1 is the default arm, and it is defined by absence: the command tried to
+// do its work, something under it failed, and this binary could not classify
+// what. Two shapes reach it (issue #45):
 //
 //   - a phase ran and failed. It wrote a failed checkpoint and left the case at
 //     PhaseFailed, so the case is resumable once the cause is fixed.
 //     ErrBudgetExhausted is the clean example: raise --max-tokens, resume, and
-//     the case completes. That promise is real and specific to this shape.
-//   - an I/O fault against the work dir or stdout: a work root that is not a
-//     directory, a case file this process may not read, a full disk, a closed
-//     pipe. These can fail before any case exists, so this shape promises
-//     nothing to resume.
+//     the case completes. That promise is real, and specific to this shape.
+//   - a filesystem or I/O fault the CLI did not classify: a work root that is
+//     not a directory, a case file this process may not read, a full disk, a
+//     closed pipe. These can fail before any case exists, so this shape
+//     promises nothing to resume.
 //
-// So exit 1 does not on its own mean "there is a case waiting". What it does
-// mean is that the failure is contingent on something that can change without a
-// different command or a different binary. Every path where retrying is
-// definitionally futile is in the exit-2 set above.
+// Exit 1 therefore makes the weaker claim on purpose, and the asymmetry is the
+// point: exit 2 is a positive statement, exit 1 is the lack of one. It must not
+// be read as "this will clear on its own" — an unclassified fault can be every
+// bit as permanent as a refusal, and a --work root the process may not write is
+// exactly that. A wrapper may retry exit 1 a bounded number of times; it must
+// never retry it indefinitely, and it must not treat exit 1 as proof there is a
+// case waiting to be resumed.
 func exitCode(err error) int {
 	switch {
 	case err == nil, errors.Is(err, flag.ErrHelp):
@@ -140,7 +154,7 @@ func exitCode(err error) int {
 		errors.Is(err, orchestrator.ErrBadAlert),
 		errors.Is(err, orchestrator.ErrPipelineMismatch),
 		errors.Is(err, orchestrator.ErrNoSuchCase),
-		errors.Is(err, orchestrator.ErrCorruptCase):
+		errors.Is(err, orchestrator.ErrUnusableCase):
 		return 2
 	default:
 		return 1
@@ -177,14 +191,19 @@ func (a *app) run(ctx context.Context, args []string) error {
 	}
 }
 
-// checkWorkRoot rejects an empty --work.
+// checkWorkRoot rejects an empty --work. Both commands need it, for different
+// reasons (issue #45).
 //
-// orchestrator.New already refuses an empty Options.Root, but that refusal is a
-// library invariant and arrives as an ordinary error, so it landed on the exit-1
-// default (issue #45). An empty --work is a bad invocation like any other, and
-// `cost --work "" <id>` is worse than useless without this check: it resolves
-// the case dir relative to the process's cwd and reports whatever it finds, or
-// does not find, there. Checking it here puts both commands on the usage arm.
+// hunt: orchestrator.New already refuses an empty Options.Root, but that refusal
+// is a library invariant arriving as an ordinary error, so it landed on the
+// exit-1 default. Checking here puts it on the usage arm where a bad invocation
+// belongs.
+//
+// cost: it never calls New, so nothing refused it at all. filepath.Join("", id)
+// is id, so `cost --work "" c-1` resolves the case against the process's cwd —
+// and if the cwd happens to hold c-1/case.json, it prints a different case's
+// cost and exits 0. That is the worse bug of the two: a wrong answer reported as
+// success, rather than a right refusal reported with the wrong code.
 func checkWorkRoot(work string) error {
 	if work == "" {
 		return fmt.Errorf("%w: --work needs a directory", errUsage)

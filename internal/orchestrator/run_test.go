@@ -1028,9 +1028,13 @@ func TestResumeUnknownCase(t *testing.T) {
 // TestUnreadableCaseStateIsClassified pins the split issue #45 turns on. Both
 // halves refuse permanently, so both are exit 2 at the CLI, but they name
 // different operator actions and must not collapse into one another:
-// ErrNoSuchCase means the ID is wrong, ErrCorruptCase means the work dir is
-// damaged. A read fault that is neither — a permission denial — stays
-// unclassified so it keeps exit 1, because chmod makes the same command work.
+// ErrNoSuchCase means the ID is wrong, ErrUnusableCase means this binary cannot
+// read the case's state as written.
+//
+// A read fault that is neither — a permission denial — stays unclassified and
+// keeps exit 1. Not because it is transient: a root-owned case file is as
+// permanent as damage. It is that the CLI cannot tell the two apart from a
+// syscall error, and exit 1 is the arm for what it cannot classify.
 func TestUnreadableCaseStateIsClassified(t *testing.T) {
 	root := t.TempDir()
 	caseDir := filepath.Join(root, "c-x")
@@ -1044,8 +1048,8 @@ func TestUnreadableCaseStateIsClassified(t *testing.T) {
 			t.Fatalf("writing case file: %v", err)
 		}
 		_, err := ReadCase(caseDir)
-		if !errors.Is(err, ErrCorruptCase) {
-			t.Fatalf("ReadCase error = %v, want ErrCorruptCase", err)
+		if !errors.Is(err, ErrUnusableCase) {
+			t.Fatalf("ReadCase error = %v, want ErrUnusableCase", err)
 		}
 		if errors.Is(err, ErrNoSuchCase) {
 			t.Error("a case that is present but undecodable reported itself as absent")
@@ -1058,8 +1062,8 @@ func TestUnreadableCaseStateIsClassified(t *testing.T) {
 			t.Fatalf("writing checkpoint: %v", err)
 		}
 		t.Cleanup(func() { os.Remove(path) })
-		if _, err := LoadCheckpoints(caseDir); !errors.Is(err, ErrCorruptCase) {
-			t.Fatalf("LoadCheckpoints error = %v, want ErrCorruptCase", err)
+		if _, err := LoadCheckpoints(caseDir); !errors.Is(err, ErrUnusableCase) {
+			t.Fatalf("LoadCheckpoints error = %v, want ErrUnusableCase", err)
 		}
 	})
 
@@ -1090,18 +1094,18 @@ func TestUnreadableCaseStateIsClassified(t *testing.T) {
 		if err == nil {
 			t.Fatal("ReadCase succeeded on a case file it may not read")
 		}
-		if errors.Is(err, ErrNoSuchCase) || errors.Is(err, ErrCorruptCase) {
+		if errors.Is(err, ErrNoSuchCase) || errors.Is(err, ErrUnusableCase) {
 			t.Errorf("error = %v, want an unclassified fault: the file is intact and chmod makes the same command work", err)
 		}
 	})
 }
 
-// TestCorruptCheckpointOutputIsCorruptCase covers the one corruption reachable
+// TestCorruptCheckpointOutputIsUnusableCase covers the fifth cause, reachable
 // only mid-walk: a completed checkpoint whose output does not decode as its
 // phase's type. A completed phase is never re-run, so the bytes are read again
 // on every resume — the same permanent refusal, and it must classify the same
 // way as an undecodable checkpoint file.
-func TestCorruptCheckpointOutputIsCorruptCase(t *testing.T) {
+func TestCorruptCheckpointOutputIsUnusableCase(t *testing.T) {
 	root := t.TempDir()
 	alert := writeAlert(t, t.TempDir(), alertFixture)
 	h := &fakeHound{finding: cannedFinding(), spend: cannedSpend()}
@@ -1131,8 +1135,8 @@ func TestCorruptCheckpointOutputIsCorruptCase(t *testing.T) {
 	}
 
 	forbidden := &fakeHound{forbidden: t}
-	if _, err := newTest(t, root, forbidden, nil).Resume(t.Context(), res.Case.ID); !errors.Is(err, ErrCorruptCase) {
-		t.Fatalf("Resume error = %v, want ErrCorruptCase", err)
+	if _, err := newTest(t, root, forbidden, nil).Resume(t.Context(), res.Case.ID); !errors.Is(err, ErrUnusableCase) {
+		t.Fatalf("Resume error = %v, want ErrUnusableCase", err)
 	}
 }
 

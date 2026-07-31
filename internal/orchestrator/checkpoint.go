@@ -74,11 +74,13 @@ func checkpointName(index int, phase Phase) string {
 // resume and `bloodhound cost`.
 //
 // A checkpoint that does not decode, does not carry a supported schema version,
-// or is not named with a walk index is ErrCorruptCase: it is the same permanent
-// refusal an undecodable case.json is, and the CLI must report it the same way
-// or a wrapper retrying exit 1 loops on it forever (issue #45). A missing
-// checkpoint dir is not corruption — a case can legitimately have no
-// checkpoints yet — and reports no checkpoints and no error.
+// or is not named with a walk index is ErrUnusableCase: this binary cannot read
+// the case's state as written, which no rerun of it changes, so the CLI must
+// report it as the same refusal an undecodable case.json gets or a wrapper
+// retrying exit 1 loops on it forever (issue #45). The three are not equally
+// serious — only the first is damage; see ErrUnusableCase — so each says which
+// it is. A missing checkpoint dir is none of them: a case can legitimately have
+// no checkpoints yet, and that reports no checkpoints and no error.
 func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 	dir := filepath.Join(caseDir, checkpointDir)
 	entries, err := os.ReadDir(dir)
@@ -100,7 +102,8 @@ func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 		}
 		seq, err := checkpointSeq(e.Name())
 		if err != nil {
-			return nil, fmt.Errorf("checkpoint %s: %w: %w", e.Name(), ErrCorruptCase, err)
+			return nil, fmt.Errorf("checkpoint %s: %w: %w — this binary did not write it; move it out of %s and the case reads normally",
+				e.Name(), ErrUnusableCase, err, checkpointDir)
 		}
 		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
@@ -108,11 +111,11 @@ func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 		}
 		var cp Checkpoint
 		if err := json.Unmarshal(data, &cp); err != nil {
-			return nil, fmt.Errorf("decoding checkpoint %s: %w: %w", e.Name(), ErrCorruptCase, err)
+			return nil, fmt.Errorf("decoding checkpoint %s: %w: %w", e.Name(), ErrUnusableCase, err)
 		}
 		if cp.SchemaVersion != CheckpointSchemaVersion {
-			return nil, fmt.Errorf("checkpoint %s: %w: schema_version %d is not supported (want %d)",
-				e.Name(), ErrCorruptCase, cp.SchemaVersion, CheckpointSchemaVersion)
+			return nil, fmt.Errorf("checkpoint %s: %w: schema_version %d, but this binary writes and reads %d — the case was touched by a different bloodhound, so check for version skew rather than deleting it",
+				e.Name(), ErrUnusableCase, cp.SchemaVersion, CheckpointSchemaVersion)
 		}
 		found = append(found, numbered{seq: seq, cp: cp})
 	}
