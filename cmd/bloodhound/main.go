@@ -2,12 +2,16 @@
 // agent pack. See specs/001-build-spec.md for the architecture and
 // specs/002-m1-metrics-path.md §4 for the orchestrator this CLI drives.
 //
-// Exit codes: 0 success, 1 the command failed, 2 the CLI refused — a bad
-// invocation, an unusable alert file, or a case whose recorded pipeline
-// version is not the one this binary walks (recording none counts as a
-// mismatch). A failed phase leaves a resumable case, but exit 1 is also the
-// catch-all for failures that leave nothing to resume, so it is not on its own
-// a signal that retrying will help; see exitCode.
+// Exit codes split recognized refusals from unclassified faults. 0 is success.
+// 2 is a refusal the CLI made deliberately, from a closed set: a bad
+// invocation, a command this binary does not implement yet (serve and replay,
+// which arrive in M2), an unusable alert file, or a case that is missing,
+// unreadable by this binary, or written by a pipeline version it does not walk.
+// 1 is everything else: the command tried its work and something under it
+// failed that this binary could not classify — a phase, which leaves a
+// resumable case, or an I/O fault, which may leave nothing to resume. Exit 1 is
+// not a promise that retrying helps; an unclassified fault can be as permanent
+// as a refusal. See exitCode for the full contract.
 package main
 
 import (
@@ -43,17 +47,41 @@ Environment:
   BLOODHOUND_MCP_PROM path to the mcp-prom server binary
   PROM_URL            Prometheus base URL handed to mcp-prom
 
-Exit codes: 0 ok, 1 the command failed (a failed phase leaves a resumable
-case; other failures may leave nothing to resume), 2 refused — bad
-invocation, unusable alert file, or a case whose recorded pipeline version
-is not the one this binary walks (a case recording none is a mismatch too).
+Exit codes:
+  0  ok.
+  1  an unclassified fault: the command ran and something under it failed
+     that this binary could not name. Either a phase failed — which leaves
+     the case resumable once the cause is fixed, so after a budget failure
+     raise --max-tokens and --resume — or an I/O fault hit the work dir or
+     stdout, which may leave nothing to resume. Not a promise that retrying
+     helps: a work dir this process may not write is exit 1 and stays that
+     way. Retry a bounded number of times, never indefinitely.
+  2  a refusal this binary made deliberately, from a closed set: a bad
+     invocation, a command it does not implement yet (serve, replay — M2),
+     an unusable alert file, or a case that is missing, unreadable by this
+     binary, or written by a pipeline version it does not walk (a case
+     recording none is a mismatch too). Rerunning unchanged always fails
+     the same way, so stop and read the message: it says what to change.
+     "Unreadable" is not always damage — a checkpoint from a newer
+     bloodhound reports here too, and deleting the case is the wrong move.
+     A refused alert file still leaves a case to resume once it is fixed.
 `
 
-// errUsage marks an invocation the CLI refused before doing any work. It maps
-// to exit code 2, the same code an unusable alert file and a pipeline-version
-// mismatch get: all three mean "fix something first, retrying this as-is
+// errUsage marks an invocation the CLI refused before doing any work: no
+// command, an unknown one, a flag the command does not take, a missing or
+// conflicting target, an empty --work. It maps to exit code 2, with the other
+// refusals — all of them mean "change something first, rerunning this as-is
 // changes nothing". See exitCode for the full contract.
 var errUsage = errors.New("usage")
+
+// errNotImplemented marks a command this binary knows the name of but does not
+// implement yet: serve and replay, which arrive in M2 (spec 002 §6). It maps to
+// exit code 2 rather than to the exit 1 it used to get (issue #45). Nothing
+// ran, nothing was written, and no retry of this binary can ever succeed — it
+// takes a newer binary — so a wrapper that retries exit 1 would loop on it for
+// a whole milestone. It is kept apart from errUsage because the invocation is
+// not wrong; it is early.
+var errNotImplemented = errors.New("not implemented")
 
 func main() {
 	// Ctrl-C and SIGTERM cancel the run's context: phases stop at their next
@@ -70,30 +98,63 @@ func main() {
 	os.Exit(exitCode(err))
 }
 
-// exitCode maps a command error to the process exit status.
+// exitCode maps a command error to the process exit status. The distinction a
+// retrying wrapper keys on is refusal (2) versus fault (1).
 //
-// Exit 2 is the closed set enumerated below, and only that set: the CLI
-// refused, and rerunning the same command without first changing something
-// outside this binary will fail identically. ErrPipelineMismatch belongs here
-// (issue #24) — the orchestrator refuses that case with deliberately no
-// migration path, so it is not resumable at any cost, and reporting it as 1
-// would make a wrapper that retries exit 1 loop on it forever.
+// Exit 2 is a recognized refusal: the CLI identified the command or its inputs
+// as ones it will not act on, and said so deliberately. It is the closed set
+// enumerated below and only that set, and a wrapper must stop and surface it.
+// The members, and what each tells an operator to change:
 //
-// Exit 1 is the catch-all default, so it is weaker than its name suggests. A
-// failed phase does leave a resumable case: ErrBudgetExhausted is the clean
-// example, where raising --max-tokens and resuming succeeds. But exit 1 also
-// catches failures that leave nothing to resume — serve and replay before M2,
-// an empty --work, and a cost or resume against a case dir that is missing or
-// undecodable. A wrapper must not read exit 1 on its own as "retrying will
-// help". Whether those belong in 2 as well is a separate contract decision,
-// tracked outside this change.
+//   - errUsage — the invocation. Includes an empty --work, which for hunt used
+//     to reach orchestrator.New and fall out as 1, and for cost was worse: see
+//     checkWorkRoot.
+//   - errNotImplemented — nothing, yet: serve and replay need an M2 binary.
+//   - orchestrator.ErrBadAlert — the alert file.
+//   - orchestrator.ErrPipelineMismatch — nothing can change it (issue #24).
+//     The orchestrator refuses that case with deliberately no migration path.
+//   - orchestrator.ErrNoSuchCase — the case ID; there is no such case.
+//   - orchestrator.ErrUnusableCase — the work dir, though not always by
+//     repairing it: only some causes are damage, and version skew is one of the
+//     others. The sentinel's own doc enumerates all five; the message says which.
+//
+// Rerunning any of them unchanged fails identically. That is a property every
+// member has, but it is not what defines the set — see below — and it does not
+// mean nothing happened: ErrBadAlert opens the case before intake reads the
+// file, on purpose, so it is refused and still leaves a case to resume once the
+// file is fixed (spec 002 §4.3), pinned by
+// TestBadAlertFileExitsTwoButLeavesAResumableCase.
+//
+// Exit 1 is the default arm, and it is defined by absence: the command tried to
+// do its work, something under it failed, and this binary could not classify
+// what. Two shapes reach it (issue #45):
+//
+//   - a phase ran and failed. It wrote a failed checkpoint and left the case at
+//     PhaseFailed, so the case is resumable once the cause is fixed.
+//     ErrBudgetExhausted is the clean example: raise --max-tokens, resume, and
+//     the case completes. That promise is real, and specific to this shape.
+//   - a filesystem or I/O fault the CLI did not classify: a work root that is
+//     not a directory, a case file this process may not read, a full disk, a
+//     closed pipe. These can fail before any case exists, so this shape
+//     promises nothing to resume.
+//
+// Exit 1 therefore makes the weaker claim on purpose, and the asymmetry is the
+// point: exit 2 is a positive statement, exit 1 is the lack of one. It must not
+// be read as "this will clear on its own" — an unclassified fault can be every
+// bit as permanent as a refusal, and a --work root the process may not write is
+// exactly that. A wrapper may retry exit 1 a bounded number of times; it must
+// never retry it indefinitely, and it must not treat exit 1 as proof there is a
+// case waiting to be resumed.
 func exitCode(err error) int {
 	switch {
 	case err == nil, errors.Is(err, flag.ErrHelp):
 		return 0
 	case errors.Is(err, errUsage),
+		errors.Is(err, errNotImplemented),
 		errors.Is(err, orchestrator.ErrBadAlert),
-		errors.Is(err, orchestrator.ErrPipelineMismatch):
+		errors.Is(err, orchestrator.ErrPipelineMismatch),
+		errors.Is(err, orchestrator.ErrNoSuchCase),
+		errors.Is(err, orchestrator.ErrUnusableCase):
 		return 2
 	default:
 		return 1
@@ -115,8 +176,9 @@ func (a *app) run(ctx context.Context, args []string) error {
 		return a.cost(rest)
 	case "serve", "replay":
 		// M2 (spec 002 §6): serve is the webhook intake, replay re-runs a
-		// case from its captures without paid calls.
-		return fmt.Errorf("%q is not implemented yet (M2)", cmd)
+		// case from its captures without paid calls. Until then this is a
+		// refusal, not a failure — see errNotImplemented.
+		return fmt.Errorf("%w: %q arrives in M2", errNotImplemented, cmd)
 	case "version":
 		fmt.Fprintln(a.stdout, version)
 		return nil
@@ -127,6 +189,26 @@ func (a *app) run(ctx context.Context, args []string) error {
 		fmt.Fprint(a.stderr, usage)
 		return fmt.Errorf("%w: unknown command %q", errUsage, cmd)
 	}
+}
+
+// checkWorkRoot rejects an empty --work. Both commands need it, for different
+// reasons (issue #45).
+//
+// hunt: orchestrator.New already refuses an empty Options.Root, but that refusal
+// is a library invariant arriving as an ordinary error, so it landed on the
+// exit-1 default. Checking here puts it on the usage arm where a bad invocation
+// belongs.
+//
+// cost: it never calls New, so nothing refused it at all. filepath.Join("", id)
+// is id, so `cost --work "" c-1` resolves the case against the process's cwd —
+// and if the cwd happens to hold c-1/case.json, it prints a different case's
+// cost and exits 0. That is the worse bug of the two: a wrong answer reported as
+// success, rather than a right refusal reported with the wrong code.
+func checkWorkRoot(work string) error {
+	if work == "" {
+		return fmt.Errorf("%w: --work needs a directory", errUsage)
+	}
+	return nil
 }
 
 // newFlagSet builds a flag set that reports parse errors as usage errors

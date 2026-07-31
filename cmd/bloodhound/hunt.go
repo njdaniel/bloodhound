@@ -38,6 +38,9 @@ func (a *app) hunt(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("%w: %w", errUsage, err)
 	}
+	if err := checkWorkRoot(*work); err != nil {
+		return err
+	}
 	switch {
 	case *alert == "" && *resume == "":
 		return fmt.Errorf("%w: hunt needs --alert <file> or --resume <case-id>", errUsage)

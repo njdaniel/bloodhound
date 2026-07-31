@@ -1014,8 +1014,129 @@ func TestResumeCaseWithNoRecordedPipeline(t *testing.T) {
 
 func TestResumeUnknownCase(t *testing.T) {
 	h := &fakeHound{finding: cannedFinding()}
-	if _, err := newTest(t, t.TempDir(), h, nil).Resume(t.Context(), "c-nope"); err == nil {
+	_, err := newTest(t, t.TempDir(), h, nil).Resume(t.Context(), "c-nope")
+	if err == nil {
 		t.Fatal("Resume succeeded on a case that was never opened")
+	}
+	// The CLI keys exit 2 off this sentinel (issue #45): a case that is not
+	// there is not a fault to retry, it is an ID to correct.
+	if !errors.Is(err, ErrNoSuchCase) {
+		t.Errorf("Resume error = %v, want ErrNoSuchCase", err)
+	}
+}
+
+// TestUnreadableCaseStateIsClassified pins the split issue #45 turns on. Both
+// halves refuse permanently, so both are exit 2 at the CLI, but they name
+// different operator actions and must not collapse into one another:
+// ErrNoSuchCase means the ID is wrong, ErrUnusableCase means this binary cannot
+// read the case's state as written.
+//
+// A read fault that is neither — a permission denial — stays unclassified and
+// keeps exit 1. Not because it is transient: a root-owned case file is as
+// permanent as damage. It is that the CLI cannot tell the two apart from a
+// syscall error, and exit 1 is the arm for what it cannot classify.
+func TestUnreadableCaseStateIsClassified(t *testing.T) {
+	root := t.TempDir()
+	caseDir := filepath.Join(root, "c-x")
+	if err := os.MkdirAll(filepath.Join(caseDir, checkpointDir), 0o755); err != nil {
+		t.Fatalf("creating case dir: %v", err)
+	}
+	casePath := filepath.Join(caseDir, CaseFile)
+
+	t.Run("undecodable case file", func(t *testing.T) {
+		if err := os.WriteFile(casePath, []byte("{ not json"), 0o644); err != nil {
+			t.Fatalf("writing case file: %v", err)
+		}
+		_, err := ReadCase(caseDir)
+		if !errors.Is(err, ErrUnusableCase) {
+			t.Fatalf("ReadCase error = %v, want ErrUnusableCase", err)
+		}
+		if errors.Is(err, ErrNoSuchCase) {
+			t.Error("a case that is present but undecodable reported itself as absent")
+		}
+	})
+
+	t.Run("undecodable checkpoint", func(t *testing.T) {
+		path := filepath.Join(caseDir, checkpointDir, "01-intake.json")
+		if err := os.WriteFile(path, []byte("{ not json"), 0o644); err != nil {
+			t.Fatalf("writing checkpoint: %v", err)
+		}
+		t.Cleanup(func() { os.Remove(path) })
+		if _, err := LoadCheckpoints(caseDir); !errors.Is(err, ErrUnusableCase) {
+			t.Fatalf("LoadCheckpoints error = %v, want ErrUnusableCase", err)
+		}
+	})
+
+	t.Run("absent case file", func(t *testing.T) {
+		if _, err := ReadCase(filepath.Join(root, "c-nope")); !errors.Is(err, ErrNoSuchCase) {
+			t.Fatalf("ReadCase error = %v, want ErrNoSuchCase", err)
+		}
+	})
+
+	t.Run("unreadable case file is a fault, not a refusal", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root: mode 000 is still readable")
+		}
+		if err := os.WriteFile(casePath, []byte(`{"id":"c-x"}`), 0o644); err != nil {
+			t.Fatalf("writing case file: %v", err)
+		}
+		// Chmod separately: WriteFile only applies the mode when it creates
+		// the file, and this one already exists from the subtests above.
+		if err := os.Chmod(casePath, 0o000); err != nil {
+			t.Fatalf("making the case file unreadable: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(casePath, 0o644); err != nil {
+				t.Errorf("restoring case file mode: %v", err)
+			}
+		})
+		_, err := ReadCase(caseDir)
+		if err == nil {
+			t.Fatal("ReadCase succeeded on a case file it may not read")
+		}
+		if errors.Is(err, ErrNoSuchCase) || errors.Is(err, ErrUnusableCase) {
+			t.Errorf("error = %v, want an unclassified fault: the file is intact and chmod makes the same command work", err)
+		}
+	})
+}
+
+// TestCorruptCheckpointOutputIsUnusableCase covers the fifth cause, reachable
+// only mid-walk: a completed checkpoint whose output does not decode as its
+// phase's type. A completed phase is never re-run, so the bytes are read again
+// on every resume — the same permanent refusal, and it must classify the same
+// way as an undecodable checkpoint file.
+func TestCorruptCheckpointOutputIsUnusableCase(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	h := &fakeHound{finding: cannedFinding(), spend: cannedSpend()}
+	res, err := newTest(t, root, h, nil).Hunt(t.Context(), alert)
+	if err != nil {
+		t.Fatalf("Hunt: %v", err)
+	}
+
+	// Replace the investigate checkpoint's output with a JSON value that is
+	// well-formed but is not a Finding.
+	path := filepath.Join(res.Case.WorkDir, checkpointDir, "02-investigate.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading checkpoint: %v", err)
+	}
+	var cp Checkpoint
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		t.Fatalf("decoding checkpoint: %v", err)
+	}
+	cp.Output = json.RawMessage(`"not a finding"`)
+	data, err := json.MarshalIndent(cp, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling checkpoint: %v", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("rewriting checkpoint: %v", err)
+	}
+
+	forbidden := &fakeHound{forbidden: t}
+	if _, err := newTest(t, root, forbidden, nil).Resume(t.Context(), res.Case.ID); !errors.Is(err, ErrUnusableCase) {
+		t.Fatalf("Resume error = %v, want ErrUnusableCase", err)
 	}
 }
 

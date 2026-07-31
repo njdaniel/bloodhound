@@ -368,6 +368,37 @@ from day one.
   resumable (§4.3) once the cause is fixed.
 - `failed` is terminal for the process but not for the case ID.
 
+**CLI exit codes.** The split is a *recognized refusal* versus an *unclassified
+fault*, and it is the contract an operator wrapper keys on (issues #24, #45).
+
+- **0** — success.
+- **2, a refusal the CLI made deliberately.** It identified the command or its
+  inputs as ones it will not act on. The set is closed: a bad invocation
+  (including an empty `--work`), a command this binary does not implement yet
+  (`serve`, `replay` — §6), an unusable alert file, a case whose recorded
+  pipeline version is not the one this binary walks (§4.3), a case ID with no
+  case under the work root, and a case whose `case.json` or checkpoints this
+  binary cannot read as written. A wrapper must stop and surface it; the message
+  says what to change. Two cautions. Refused does not mean nothing happened — a
+  bad alert file deliberately leaves a resumable case (§4.3). And "cannot read"
+  is not always damage: a checkpoint written by a *newer* binary lands here too,
+  and it is version skew, the same shape as a pipeline mismatch. The refusal is
+  right; deleting the case would not be.
+- **1, everything else.** The command tried its work and something under it
+  failed that this binary could not name. Two shapes: a phase ran and failed —
+  which writes a `failed` checkpoint and leaves the case resumable,
+  `ErrBudgetExhausted` being the clean case where raising `--max-tokens` and
+  resuming completes it — or an I/O fault against the work dir or stdout, which
+  can fail before any case exists.
+
+  Exit 1 makes the weaker claim on purpose: exit 2 is a positive statement, exit
+  1 is the lack of one. It is **not** a promise that retrying helps. An
+  unclassified fault can be as permanent as a refusal — a work root the process
+  may not write is exit 1 and stays that way — and the CLI cannot tell that from
+  a transient fault through a syscall error. A wrapper may retry exit 1 a bounded
+  number of times; it must never retry indefinitely, and must not read exit 1 as
+  proof a case is waiting.
+
 Phase contents in M1: **intake** parses one Alertmanager-format alert JSON
 into `Case`, assigns the case ID (`c-<utc yyyymmddThhmmss>-<6 hex crypto/rand>`),
 creates the work dir. **investigate** runs metrics-hound (§3). **report**
@@ -531,8 +562,12 @@ container test is a smoke check; nothing in CI's default path calls a paid API.
 - `hunt --alert fixture.json` with scripted provider + fake Prometheus:
   exit 0, work dir complete, `report.json` matches golden.
 - `hunt --resume` on the kill-mid-investigate work dir (the §4.3 acceptance
-  test). Exit codes: bad alert file 2, pipeline-version mismatch on resume 2,
-  phase failure 1.
+  test). Exit codes per §4.1: bad alert file 2, pipeline-version mismatch on
+  resume 2, an unknown or unreadable case on resume or `cost` 2, `serve` and
+  `replay` before M2 2, an empty `--work` 2. Both shapes of exit 1 are pinned —
+  a phase failure, which must leave a resumable case, and an I/O fault (a
+  `--work` root that is a regular file), which must not be swept into 2 by a
+  later change to the default arm.
 
 **Live demo (manual, documented in the PR, not CI):** kind cluster + Prometheus
 scraping it; break a pod manually (bad image or CPU-starved limits); craft the

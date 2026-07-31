@@ -30,13 +30,62 @@ const (
 
 // ErrBadAlert marks a case that cannot start because its alert file is
 // missing, unreadable, or not a usable Alertmanager alert. The CLI maps it to
-// exit code 2, as it does ErrPipelineMismatch; every other phase failure is
-// exit 1.
+// exit code 2 — a refusal, since rerunning against the same file fails
+// identically.
+//
+// It is the one refusal that still leaves a resumable case: Hunt creates the
+// work dir before intake reads the file, on purpose, so the operator fixes the
+// file and resumes rather than starting over (spec 002 §4.3). Exit 2 therefore
+// does not mean "nothing happened", and nothing in the CLI's contract may say
+// that it does.
 var ErrBadAlert = errors.New("orchestrator: unusable alert file")
+
+// ErrNoSuchCase reports that the work root holds no case with the given ID:
+// `--resume c-typo` or `cost c-typo`. Nothing ran and nothing was written, and
+// rerunning the same command finds the same absence — the ID itself is what has
+// to change. The CLI maps it to exit code 2 for that reason (issue #45).
+//
+// It is deliberately distinct from ErrUnusableCase: both are refusals, but they
+// tell an operator to do different things. This one means "you named the wrong
+// case"; the other means "this binary cannot read the case you named".
+var ErrNoSuchCase = errors.New("orchestrator: no such case")
+
+// ErrUnusableCase reports that a case's recorded state is there but this binary
+// cannot read it as written. The CLI maps it to exit code 2 (issue #45): no
+// rerun of this binary gets past it, so a wrapper that retried exit 1 would loop
+// forever on, say, a work dir truncated by a full disk.
+//
+// It deliberately does not claim the case is damaged, because only some of its
+// causes are damage. All five, and what each asks of an operator:
+//
+//   - case.json is not valid JSON — damage; repair or discard the case.
+//   - a checkpoint file is not valid JSON — damage; same.
+//   - a completed checkpoint's output does not decode as its phase's type
+//     (see run.adopt) — damage; same. A completed phase is never re-run, so
+//     those bytes are read again on every resume.
+//   - a checkpoint records an unsupported schema_version — most likely version
+//     skew, not damage: a newer binary wrote it and can still read it. Treat it
+//     the way ErrPipelineMismatch is treated, by checking which binary touched
+//     the case, and do not delete anything.
+//   - a checkpoint filename carries no walk index — a foreign file in
+//     checkpoints/, not damage at all: the case is intact and resumes once the
+//     file is moved out. atomicWrite's temp files are named .tmp-* with no
+//     .json suffix, so crash debris never lands here; a human or another tool
+//     put it there.
+//
+// The wrapped message names which of the five it was. Nothing that reads this
+// sentinel may tell an operator the case is corrupt.
+var ErrUnusableCase = errors.New("orchestrator: unusable case state")
 
 // ErrBudgetExhausted reports that spend already recorded in this case's
 // checkpoints for the phase about to run leaves it no budget. It is what stops
 // a crash loop from multiplying cost across resumes (spec 002 §4.3).
+//
+// It is the exit-1 member whose promise reads true without qualification: the
+// phase was refused, but the refusal is written as a failed checkpoint, so the
+// case is on disk and raising --max-tokens and resuming completes it. Issue #45
+// moved several paths off exit 1 for lacking exactly that property; this one
+// keeps it, and the CLI's exit-1 contract is written around it.
 var ErrBudgetExhausted = errors.New("orchestrator: budget exhausted by prior attempts")
 
 // ErrPipelineMismatch reports that the case being resumed records a different
@@ -367,12 +416,17 @@ func (o *Orchestrator) run(ctx context.Context, r *run) (Result, error) {
 
 // adopt deserializes a completed checkpoint's output as that phase's result,
 // so a resumed walk continues with the same state the original run had.
+//
+// An output that does not decode as its phase's type is ErrUnusableCase, the
+// same permanent refusal an undecodable checkpoint file is: the checkpoint is
+// only ever rewritten by re-running the phase, and a completed phase is never
+// re-run, so retrying reads the same bytes forever (issue #45).
 func (r *run) adopt(phase Phase, cp Checkpoint) error {
 	switch phase {
 	case PhaseIntake:
 		var c Case
 		if err := json.Unmarshal(cp.Output, &c); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrUnusableCase, err)
 		}
 		r.c.AlertName = c.AlertName
 		r.c.Labels = c.Labels
@@ -383,13 +437,13 @@ func (r *run) adopt(phase Phase, cp Checkpoint) error {
 	case PhaseInvestigate:
 		var f Finding
 		if err := json.Unmarshal(cp.Output, &f); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrUnusableCase, err)
 		}
 		r.finding = f
 	case PhaseReport:
 		var out ReportOutput
 		if err := json.Unmarshal(cp.Output, &out); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrUnusableCase, err)
 		}
 		r.artifacts = out.Artifacts
 	default:
