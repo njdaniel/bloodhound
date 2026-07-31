@@ -66,6 +66,14 @@ func (f *fakeProm) set(path string, status int, body string) {
 	f.responses[path] = fakeResponse{status, body}
 }
 
+// body returns the canned response body currently set for path, so a test can
+// build a variant of a fixture without restating it.
+func (f *fakeProm) body(path string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.responses[path].body
+}
+
 // lastParams returns the query parameters of the last request to path.
 func (f *fakeProm) lastParams(path string) url.Values {
 	f.mu.Lock()
