@@ -37,16 +37,24 @@ type fakeAPI struct {
 	statuses []int
 
 	// hits counts requests that reached the handler and hands each one its
-	// index. Atomic because the handler runs on the server's goroutines rather
-	// than the test's. That is hygiene, not a live race: Complete is
-	// synchronous, so handler invocations never actually overlap today — but
-	// nothing in the fake enforces that, and the first concurrent test to use
-	// it would make the race real.
+	// index. Atomic so count() can read it without taking mu — but the handler
+	// still increments it under mu, see below.
 	hits atomic.Int64
 
-	// mu guards bodies, which needs more than an atomic can express.
+	// mu guards bodies *and* the index handed out with each increment of hits.
+	// Both under one lock, because an atomic alone would buy race-freedom
+	// without buying correctness: with the increment and the append as separate
+	// steps, two overlapping handlers can take indices 0 and 1 and then append
+	// in the opposite order, at which point bodies[i] is not the body of the
+	// request that was answered with respond[i].
+	//
+	// Synchronizing at all is hygiene rather than a fix for a live race:
+	// Complete is synchronous, so handler invocations never actually overlap
+	// today. But nothing in the fake enforces that, and the first concurrent
+	// test to use it would make the race real.
 	mu sync.Mutex
-	// bodies holds the decoded body of every request, in arrival order.
+	// bodies holds the decoded body of every request, in arrival order:
+	// bodies[i] is the request answered with respond[i] and statuses[i].
 	bodies []map[string]any
 }
 
@@ -76,8 +84,10 @@ func newFakeAPI(tb testing.TB, responses ...string) *fakeAPI {
 			http.Error(w, "request body is not JSON", http.StatusBadRequest)
 			return
 		}
-		i := int(f.hits.Add(1)) - 1
+		// Taking the index and recording the body at it is one step, so that
+		// bodies[i] is this request even if handlers ever overlap.
 		f.mu.Lock()
+		i := int(f.hits.Add(1)) - 1
 		f.bodies = append(f.bodies, body)
 		f.mu.Unlock()
 
@@ -165,14 +175,36 @@ func (tb *recordingTB) counts() (errorfs, fatalfs int) {
 // directly with a body that is not JSON, and checks both ends of the bug — the
 // handler must report with Errorf rather than Fatalf, and the client must get a
 // complete HTTP response back rather than a dropped connection. Against the old
-// code both assertions fail, the second one with exactly the confusing
+// code all three assertions below fire: Fatalf once instead of never, Errorf
+// never instead of once, and the POST itself failing with exactly the confusing
 // downstream EOF that motivated the fix.
+//
+// The order matters. How the handler reported is checked first, because the
+// POST fails against the old code, and reporting that with t.Fatalf would end
+// the test before the Fatalf/Errorf counts were ever read — leaving the two
+// assertions that name the actual bug dead in precisely the scenario they exist
+// for.
 func TestFakeAPIHandlerDoesNotGoexit(t *testing.T) {
 	tb := &recordingTB{t: t}
 	fake := newFakeAPI(tb, endTurnResponse)
 
 	resp, err := http.Post(fake.server.URL+"/v1/messages", "application/json",
 		strings.NewReader("this is not JSON"))
+
+	// Reading the counts here is safe without further synchronization: the
+	// handler reports before it answers (or, with the bug, before its goroutine
+	// unwinds and net/http closes the connection), and either way the POST above
+	// has already observed that.
+	errorfs, fatalfs := tb.counts()
+	if fatalfs != 0 {
+		t.Errorf("handler called Fatalf %d times, want 0: FailNow off the test "+
+			"goroutine kills the handler, not the test", fatalfs)
+	}
+	if errorfs != 1 {
+		t.Errorf("handler called Errorf %d times, want 1: a malformed request "+
+			"must still fail the test", errorfs)
+	}
+
 	if err != nil {
 		t.Fatalf("POST to the fake: %v — a handler that calls runtime.Goexit "+
 			"drops the connection instead of answering", err)
@@ -183,16 +215,6 @@ func TestFakeAPIHandlerDoesNotGoexit(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d for a body that is not JSON", resp.StatusCode, http.StatusBadRequest)
-	}
-
-	errorfs, fatalfs := tb.counts()
-	if fatalfs != 0 {
-		t.Errorf("handler called Fatalf %d times, want 0: FailNow off the test "+
-			"goroutine kills the handler, not the test", fatalfs)
-	}
-	if errorfs != 1 {
-		t.Errorf("handler called Errorf %d times, want 1: a malformed request "+
-			"must still fail the test", errorfs)
 	}
 }
 
