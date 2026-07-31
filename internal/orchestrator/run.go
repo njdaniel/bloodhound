@@ -187,8 +187,43 @@ func New(opts Options) (*Orchestrator, error) {
 	return o, nil
 }
 
-// now reads the configured clock in UTC.
+// now reads the configured clock in UTC, for values that get serialized —
+// checkpoint timestamps, the report's GeneratedAt, a new case ID.
+//
+// It must not be used to measure elapsed time. `.UTC()` strips the monotonic
+// clock reading time.Now carries, so subtracting two now() values is wall-clock
+// arithmetic and an NTP step backwards mid-phase measures negative time
+// (issue #46). Duration measurement goes through elapsedClock and elapsedMS.
 func (o *Orchestrator) now() time.Time { return o.opts.Now().UTC() }
+
+// elapsedClock reads the configured clock for duration measurement, preserving
+// whatever monotonic reading it carries. With the default time.Now that is a
+// monotonic reading, which makes the subtraction in elapsedMS immune to clock
+// steps; an injected clock that has none falls back to wall-clock arithmetic,
+// which is why elapsedMS still clamps.
+//
+// The value is deliberately not in UTC: converting it would strip the monotonic
+// reading, which is the whole point. Callers that also serialize the instant
+// call .UTC() on it at that point instead.
+func (o *Orchestrator) elapsedClock() time.Time { return o.opts.Now() }
+
+// elapsedMS reports how long something bracketed by two elapsedClock readings
+// took, in milliseconds, and never reports less than zero.
+//
+// This is the write site for Spend.WallMS, and clamping here is what keeps
+// negative time off disk. Both consumers of the recorded figure subtract it
+// from a cap — remainingBudget from the hound's budget, phaseTimeout from the
+// investigate deadline — so a negative value does not merely misreport the
+// ledger, it hands the next attempt *more* than the full cap on both. Clamping
+// in either consumer would fix only that one; clamping here fixes both, and
+// keeps `bloodhound cost` from reporting negative wall clock as well.
+func elapsedMS(started, finished time.Time) int64 {
+	d := finished.Sub(started)
+	if d < 0 {
+		return 0
+	}
+	return d.Milliseconds()
+}
 
 // Hunt opens a new case for the alert file at alertPath and walks it to
 // completion. The case work dir is created before the first phase runs, so a
@@ -414,7 +449,10 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	// The deadline is sized from the same per-phase spend the budget check
 	// charges, so the two numbers agree about how much time the phase may have.
 	timeout := o.phaseTimeout(phase, r.priorByPhase[phase])
-	started := o.now()
+	// The bracketing reads keep their monotonic reading so the duration below
+	// is measured, not inferred from two wall-clock timestamps; they are
+	// converted to UTC only where the checkpoint serializes them.
+	started := o.elapsedClock()
 
 	pctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -422,11 +460,13 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	r.phaseSpend = Spend{}
 	r.phaseRefused = false
 	out, phaseErr := fn(pctx, r)
-	finished := o.now()
+	finished := o.elapsedClock()
 
 	spend := r.phaseSpend
+	// A refused phase records no wall clock at all, so the clamp never runs for
+	// it: "not measured" must stay distinct from "measured as zero" (issue #32).
 	if !r.phaseRefused {
-		spend.WallMS = finished.Sub(started).Milliseconds()
+		spend.WallMS = elapsedMS(started, finished)
 	}
 	r.prior = r.prior.Add(spend)
 	r.priorByPhase[phase] = r.priorByPhase[phase].Add(spend)
@@ -435,8 +475,8 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 		SchemaVersion: CheckpointSchemaVersion,
 		CaseID:        r.c.ID,
 		Phase:         phase,
-		StartedAt:     started,
-		FinishedAt:    finished,
+		StartedAt:     started.UTC(),
+		FinishedAt:    finished.UTC(),
 		// The checkpoint records what this phase has cost the case, not just
 		// this attempt: it replaces any failed checkpoint for the phase, and
 		// the sum of checkpoints must stay the case's true spend.
