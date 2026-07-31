@@ -1346,6 +1346,302 @@ func TestCrashLoopStillChargesEveryAttemptThatRan(t *testing.T) {
 	}
 }
 
+// TestBackwardsClockStepDoesNotInflateBudgetOrDeadline is issue #46: an NTP
+// correction that steps the clock backwards mid-phase made
+// finished.Sub(started) negative, because .UTC() strips the monotonic reading
+// the subtraction would otherwise have used. A negative WallMS on disk is not
+// just a wrong ledger entry: both consumers subtract it from a cap, so it hands
+// the next attempt more than the full budget *and* a longer deadline than a
+// fresh case gets.
+func TestBackwardsClockStepDoesNotInflateBudgetOrDeadline(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(root, caseID)
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 60 * time.Second}
+
+	// Intake takes 1s. Then, while the hound is running, the clock steps 30s
+	// backwards, so the naive finished.Sub(started) for investigate is -30s.
+	first := &fakeHound{err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, first, func(o *Options) {
+		o.Budget = budget
+		o.Now = phaseClock(0, time.Second, 0, -30*time.Second)
+	}).Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+	if first.count() != 1 {
+		t.Fatalf("first attempt ran the hound %d times, want 1", first.count())
+	}
+
+	cps := readCheckpoints(t, caseDir)
+	// Fixture guard: the clock really did run backwards across the investigate
+	// phase, so this test is exercising the step and not a no-op.
+	investigate := checkpointFor(t, cps, PhaseInvestigate)
+	if !investigate.FinishedAt.Before(investigate.StartedAt) {
+		t.Fatalf("investigate ran %s → %s; the fixture clock did not step backwards",
+			investigate.StartedAt, investigate.FinishedAt)
+	}
+	// The timestamps are still serialized in UTC: preserving the monotonic
+	// reading where the duration is measured must not leak a local-zone
+	// timestamp into the checkpoint.
+	if loc := investigate.StartedAt.Location(); loc != time.UTC {
+		t.Errorf("checkpoint StartedAt location = %s, want UTC", loc)
+	}
+	if loc := investigate.FinishedAt.Location(); loc != time.UTC {
+		t.Errorf("checkpoint FinishedAt location = %s, want UTC", loc)
+	}
+	// Intake is unaffected, and no phase recorded negative time.
+	wantWallMS(t, cps, PhaseIntake, time.Second)
+	for _, cp := range cps {
+		if cp.Spend.WallMS < 0 {
+			t.Errorf("%s checkpoint wall clock = %dms, want no negative time on disk", cp.Phase, cp.Spend.WallMS)
+		}
+	}
+	if got := SumSpend(cps).WallMS; got < 0 {
+		t.Errorf("case ledger wall clock = %dms, want no negative total", got)
+	}
+
+	// Consequence one: the resumed hound is not handed more than the cap. The
+	// resume runs on the default forward clock, so the only thing that could
+	// inflate its budget is the figure the backwards step left on disk.
+	var deadlineLeft time.Duration
+	second := &fakeHound{finding: cannedFinding()}
+	o := newTest(t, root, second, func(opts *Options) {
+		opts.Budget = budget
+		opts.Investigate = func(ctx context.Context, c Case, b Budget) (Finding, Spend, error) {
+			if dl, ok := ctx.Deadline(); ok {
+				deadlineLeft = time.Until(dl)
+			}
+			return second.run(ctx, c, b)
+		}
+	})
+	if _, err := o.Resume(t.Context(), caseID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if got := second.lastBudget(t).MaxWallClock; got > budget.MaxWallClock {
+		t.Errorf("resumed wall-clock budget = %s, want at most the %s cap (a backwards clock step must not hand the hound extra budget)",
+			got, budget.MaxWallClock)
+	}
+
+	// Consequence two: nor is the deadline the phase runs under. The deadline
+	// comes off the real clock, so this is a bound rather than an equality.
+	if want := budget.MaxWallClock + InvestigateGrace; deadlineLeft > want {
+		t.Errorf("investigate deadline = %s away, want at most %s (a backwards clock step must not inflate the deadline)",
+			deadlineLeft, want)
+	}
+	if deadlineLeft <= 0 {
+		t.Fatalf("investigate deadline = %s away; the fixture never observed one", deadlineLeft)
+	}
+}
+
+// TestElapsedMSClampsBackwardsSteps pins the write-site clamp directly, so the
+// guarantee survives even if the orchestrator stops measuring phases this way.
+func TestElapsedMSClampsBackwardsSteps(t *testing.T) {
+	base := time.Date(2026, 7, 28, 10, 15, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		started, finished time.Time
+		want              int64
+	}{
+		{name: "forward", started: base, finished: base.Add(1500 * time.Millisecond), want: 1500},
+		{name: "no time at all", started: base, finished: base, want: 0},
+		{name: "backwards step", started: base.Add(time.Minute), finished: base, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := elapsedMS(tt.started, tt.finished); got != tt.want {
+				t.Errorf("elapsedMS = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestElapsedClockKeepsTheMonotonicReading is the other half of issue #46: the
+// clamp keeps negative time off disk, but a phase's duration should be
+// *measured* rather than inferred from two wall-clock timestamps, so that a
+// clock step mid-phase does not distort it in the first place. Under the real
+// time.Now the reads that bracket a phase must still carry their monotonic
+// reading, where now() — which serializes — deliberately drops it.
+func TestElapsedClockKeepsTheMonotonicReading(t *testing.T) {
+	h := &fakeHound{}
+	o, err := New(Options{Root: "work", Investigate: h.run, Report: fixedReport})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// time.Time.String documents that a value carrying a monotonic reading
+	// renders a trailing "m=±<value>" field, and one without it does not. That
+	// is the only exported way to observe the reading; comparing with Equal
+	// would not work, since Equal is defined to compare instants.
+	if got := o.elapsedClock(); !strings.Contains(got.String(), " m=") {
+		t.Errorf("elapsedClock() = %s, want a value carrying a monotonic reading", got)
+	}
+	if got := o.now(); strings.Contains(got.String(), " m=") {
+		t.Errorf("now() = %s, want a wall-clock-only value for serialization", got)
+	}
+	if got := o.now(); got.Location() != time.UTC {
+		t.Errorf("now() location = %s, want UTC", got.Location())
+	}
+}
+
+// TestRunPhaseMeasuresFromAnUnconvertedClock watches the issue #46 call site.
+// Swapping runPhase's two elapsedClock reads back to now() reintroduces the
+// bug, and nothing else in the suite notices: the clamp keeps the result
+// non-negative, and telling a monotonic measurement from a wall-clock one
+// requires the two clocks to disagree, which no injected clock can arrange. So
+// the property is checked on the reads themselves, taken as runPhase took them.
+func TestRunPhaseMeasuresFromAnUnconvertedClock(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+
+	type bracket struct{ started, finished time.Time }
+	observed := map[Phase]bracket{}
+	h := &fakeHound{finding: cannedFinding(), spend: cannedSpend()}
+	// The real clock is the only source of a monotonic reading, and it reports
+	// local time — so this also pins that the checkpoint still converts to UTC.
+	if _, err := newTest(t, root, h, func(o *Options) {
+		o.Now = time.Now
+		o.observePhaseClock = func(phase Phase, started, finished time.Time) {
+			observed[phase] = bracket{started: started, finished: finished}
+		}
+	}).Hunt(t.Context(), alert); err != nil {
+		t.Fatalf("Hunt: %v", err)
+	}
+
+	if len(observed) != 3 {
+		t.Fatalf("observed %d phases, want all 3", len(observed))
+	}
+	// time.Time.String renders a trailing "m=±<value>" field exactly when the
+	// value carries a monotonic reading; it is the only exported way to see it.
+	for phase, b := range observed {
+		if !strings.Contains(b.started.String(), " m=") {
+			t.Errorf("%s measured from started = %s, want a monotonic reading (runPhase must not use now() here)", phase, b.started)
+		}
+		if !strings.Contains(b.finished.String(), " m=") {
+			t.Errorf("%s measured to finished = %s, want a monotonic reading (runPhase must not use now() here)", phase, b.finished)
+		}
+	}
+
+	for _, cp := range readCheckpoints(t, filepath.Join(root, "c-20260728T101500-a1b2c3")) {
+		if loc := cp.StartedAt.Location(); loc != time.UTC {
+			t.Errorf("%s checkpoint StartedAt location = %s, want UTC", cp.Phase, loc)
+		}
+		if loc := cp.FinishedAt.Location(); loc != time.UTC {
+			t.Errorf("%s checkpoint FinishedAt location = %s, want UTC", cp.Phase, loc)
+		}
+	}
+}
+
+// TestLegacyNegativeWallClockOnDiskIsNormalized covers what the write-site
+// clamp cannot reach: a checkpoint a pre-issue-#46 binary already wrote, with a
+// negative wall_ms in it. Read back untreated it inflates the hound's budget
+// and its deadline in exactly the way the fix was meant to stop, so
+// LoadCheckpoints normalizes what it reads.
+func TestLegacyNegativeWallClockOnDiskIsNormalized(t *testing.T) {
+	root := t.TempDir()
+	alert := writeAlert(t, t.TempDir(), alertFixture)
+	caseID := "c-20260728T101500-a1b2c3"
+	caseDir := filepath.Join(root, caseID)
+	budget := Budget{MaxTokens: 10_000, MaxToolCalls: 12, MaxWallClock: 60 * time.Second}
+
+	first := &fakeHound{err: errors.New("hound crashed")}
+	if _, err := newTest(t, root, first, func(o *Options) { o.Budget = budget }).
+		Hunt(t.Context(), alert); err == nil {
+		t.Fatal("Hunt succeeded, want the hound's failure")
+	}
+
+	// Rewrite the investigate checkpoint the way a pre-fix binary would have
+	// left it after a 30s backwards clock step mid-phase.
+	path := filepath.Join(caseDir, checkpointDir, checkpointName(2, PhaseInvestigate))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading investigate checkpoint: %v", err)
+	}
+	var cp Checkpoint
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		t.Fatalf("decoding investigate checkpoint: %v", err)
+	}
+	cp.Spend.WallMS = -30_000
+	patched, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatalf("encoding investigate checkpoint: %v", err)
+	}
+	if err := os.WriteFile(path, patched, 0o644); err != nil {
+		t.Fatalf("writing investigate checkpoint: %v", err)
+	}
+	// Fixture guard: the planted value really is on disk.
+	if !strings.Contains(string(patched), `"wall_ms":-30000`) {
+		t.Fatalf("fixture did not plant a negative wall_ms: %s", patched)
+	}
+
+	if got := investigateWallMS(t, readCheckpoints(t, caseDir)); got < 0 {
+		t.Errorf("investigate wall clock read back = %dms, want it normalized to 0 or above", got)
+	}
+	if got := SumSpend(readCheckpoints(t, caseDir)).WallMS; got < 0 {
+		t.Errorf("case ledger wall clock = %dms, want no negative total", got)
+	}
+	if _, _, cost, err := Cost(root, caseID); err != nil {
+		t.Fatalf("Cost: %v", err)
+	} else if cost.WallMS < 0 {
+		t.Errorf("bloodhound cost wall clock = %dms, want no negative total", cost.WallMS)
+	}
+
+	// Both consumers again: neither the budget nor the deadline may be inflated
+	// by the figure the legacy file carries.
+	var deadlineLeft time.Duration
+	second := &fakeHound{finding: cannedFinding()}
+	o := newTest(t, root, second, func(opts *Options) {
+		opts.Budget = budget
+		opts.Investigate = func(ctx context.Context, c Case, b Budget) (Finding, Spend, error) {
+			if dl, ok := ctx.Deadline(); ok {
+				deadlineLeft = time.Until(dl)
+			}
+			return second.run(ctx, c, b)
+		}
+	})
+	if _, err := o.Resume(t.Context(), caseID); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if got := second.lastBudget(t).MaxWallClock; got > budget.MaxWallClock {
+		t.Errorf("resumed wall-clock budget = %s, want at most the %s cap (a legacy negative wall_ms must not inflate it)",
+			got, budget.MaxWallClock)
+	}
+	if want := budget.MaxWallClock + InvestigateGrace; deadlineLeft > want {
+		t.Errorf("investigate deadline = %s away, want at most %s (a legacy negative wall_ms must not inflate it)",
+			deadlineLeft, want)
+	}
+	if deadlineLeft <= 0 {
+		t.Fatalf("investigate deadline = %s away; the fixture never observed one", deadlineLeft)
+	}
+}
+
+func TestSpendNormalize(t *testing.T) {
+	full := Spend{InputTokens: 10, OutputTokens: 20, USD: 0.5, ToolCalls: 3, WallMS: 400}
+	if got := full.Normalize(); got != full {
+		t.Errorf("Normalize on a valid spend = %+v, want it unchanged at %+v", got, full)
+	}
+	negative := Spend{InputTokens: -1, OutputTokens: -2, USD: -0.5, ToolCalls: -3, WallMS: -30_000}
+	if got := negative.Normalize(); got != (Spend{}) {
+		t.Errorf("Normalize on an all-negative spend = %+v, want every field clamped to zero", got)
+	}
+	// The field that can actually go negative in practice, on its own.
+	mixed := Spend{InputTokens: 10, USD: 0.5, WallMS: -30_000}
+	if got := mixed.Normalize(); got != (Spend{InputTokens: 10, USD: 0.5}) {
+		t.Errorf("Normalize = %+v, want only WallMS clamped", got)
+	}
+}
+
+// checkpointFor returns the checkpoint recorded for a phase.
+func checkpointFor(t *testing.T, cps []Checkpoint, phase Phase) Checkpoint {
+	t.Helper()
+	for _, cp := range cps {
+		if cp.Phase == phase {
+			return cp
+		}
+	}
+	t.Fatalf("no %s checkpoint among %d", phase, len(cps))
+	return Checkpoint{}
+}
+
 // TestSpendFooterAndCostReportEveryPhase pins that scoping the hound's budget
 // and the ledger fix leave the *reporting* path whole: Result.Spend, the spend
 // the reporter renders into its footer, and `bloodhound cost` all carry the

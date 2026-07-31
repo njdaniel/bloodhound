@@ -41,6 +41,12 @@ type Checkpoint struct {
 	// Status is StatusCompleted or StatusFailed.
 	Status Status `json:"status"`
 	// StartedAt and FinishedAt bracket the attempt, in UTC.
+	//
+	// They report what the clock said, so FinishedAt can precede StartedAt if
+	// the clock stepped backwards mid-phase. Spend.WallMS does not follow it
+	// negative — it is measured monotonically and clamped (issue #46) — so the
+	// pair being inverted alongside a small or zero WallMS is the only trace
+	// left that a step occurred, and is deliberately preserved as such.
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
 	// Spend is what the phase consumed. Phases that make no model or tool
@@ -107,6 +113,11 @@ func LoadCheckpoints(caseDir string) ([]Checkpoint, error) {
 			return nil, fmt.Errorf("checkpoint %s: schema_version %d is not supported (want %d)",
 				e.Name(), cp.SchemaVersion, CheckpointSchemaVersion)
 		}
+		// A checkpoint written before the issue #46 fix can carry a negative
+		// WallMS. This is the single reader behind both resume and
+		// `bloodhound cost`, so normalizing here is the one place that keeps
+		// such a file from inflating a budget, a deadline, and the ledger.
+		cp.Spend = cp.Spend.Normalize()
 		found = append(found, numbered{seq: seq, cp: cp})
 	}
 	sort.Slice(found, func(i, j int) bool { return found[i].seq < found[j].seq })
