@@ -44,9 +44,11 @@ type CaptureRecord struct {
 
 // NewCapture wraps next with request/response capture. Files are written to
 // dir/llm/, which is created if needed. label names the caller (e.g.
-// "metrics-hound") and becomes part of each filename, so it must be
-// path-safe. Sequence numbering continues from any existing capture files in
-// the directory, so a resumed case does not restart at 000 (spec 002 §4.3).
+// "metrics-hound") and becomes part of each filename; it is sanitized by
+// seqname.Render, so a label that is not already a path-safe component is
+// rewritten rather than trusted. Sequence numbering continues from any
+// existing capture files in the directory, so a resumed case does not restart
+// at 000 (spec 002 §4.3).
 func NewCapture(next llm.Provider, dir, label string) (*Capture, error) {
 	sub := filepath.Join(dir, captureSubdir)
 	if err := os.MkdirAll(sub, 0o755); err != nil {
@@ -102,7 +104,9 @@ func (c *Capture) write(rec CaptureRecord) error {
 		return fmt.Errorf("marshaling capture record: %w", err)
 	}
 	data = append(data, '\n')
-	path := filepath.Join(c.dir, fmt.Sprintf("%03d-%s.json", rec.Seq, c.label))
+	// seqname.Render sanitizes the label, so a label that is not a path-safe
+	// component cannot steer the write outside the capture dir.
+	path := filepath.Join(c.dir, seqname.Render(rec.Seq, c.label))
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("writing capture file: %w", err)
 	}

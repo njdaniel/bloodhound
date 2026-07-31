@@ -6,10 +6,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -307,9 +309,15 @@ func TestCloseKillsChild(t *testing.T) {
 	}
 }
 
-// The two tests below check this stream end to end: the parser table they
-// depend on lives once in internal/seqname, shared with internal/llm/middleware
-// so both capture streams cannot resume with different numbering (spec 002 §4.3).
+// The two tests below check this stream end to end. Both halves of the
+// filename — seqname.Render and the seqname.Prefix that Next parses it back
+// with — now live once in internal/seqname, shared with
+// internal/llm/middleware so the two capture streams cannot resume with
+// different numbering (spec 002 §4.3). These stay local anyway: they are the
+// only place the renderer and the parser meet through this package's real
+// write path, on real files on disk, rather than through seqname's own
+// round-trip test. If this stream ever grows a filename rule of its own, this
+// is what notices.
 func TestCaptureSequenceContinuesAfterResume(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "mcp")
@@ -367,6 +375,87 @@ func TestCaptureSequenceContinuesPastThreeDigits(t *testing.T) {
 			t.Errorf("%s was overwritten: sequence numbering collided", name)
 		}
 	}
+}
+
+// TestCaptureToolNameCannotEscapeTheCaptureDir pins the reason the tool name
+// is sanitized: it is chosen by the server, not by us, so an unsanitized name
+// would let a hostile or buggy server steer the capture write anywhere the
+// process can write. The call itself fails — the fake server has no such tool
+// — but a failed call is still captured, which is exactly the path that has to
+// stay inside the capture dir.
+func TestCaptureToolNameCannotEscapeTheCaptureDir(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		want string
+	}{
+		{"parent traversal", "../../../pwned", "case/captures/mcp/000-.._.._.._pwned.json"},
+		{"path separator", "sub/dir", "case/captures/mcp/000-sub_dir.json"},
+		{"absolute path", "/etc/passwd", "case/captures/mcp/000-_etc_passwd.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "case", "captures")
+			s, _ := newSession(t, Config{CaptureDir: dir})
+
+			// Whether the server rejects the name or accepts it is not the
+			// point; the capture write happens either way.
+			_, _ = s.CallTool(context.Background(), tt.tool, json.RawMessage(`{"text":"x"}`))
+
+			got := filesUnder(t, root)
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("files written = %v, want exactly [%s]", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCaptureRefStaysInsideTheCaptureDir covers the other half: CaptureRef is
+// what a Finding cites (spec 002 §3.4), and it is rendered from the same
+// server-supplied tool name. A ref that pointed outside captures/ would send a
+// reader — or the M4 grader — somewhere the capture is not.
+func TestCaptureRefStaysInsideTheCaptureDir(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := newSession(t, Config{CaptureDir: dir})
+	res, err := s.CallTool(context.Background(), "echo", json.RawMessage(`{"text":"x"}`))
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.CaptureRef != "mcp/000-echo.json" {
+		t.Fatalf("CaptureRef = %q, want mcp/000-echo.json", res.CaptureRef)
+	}
+	// The ref resolves to the file that was actually written.
+	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(res.CaptureRef))); err != nil {
+		t.Errorf("CaptureRef %q does not resolve under the capture dir: %v", res.CaptureRef, err)
+	}
+}
+
+// filesUnder lists every regular file below root, relative to root and
+// slash-separated, so a test can assert that nothing was written outside the
+// directory it expected.
+func filesUnder(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestCaptureWriteFailureFailsCall(t *testing.T) {

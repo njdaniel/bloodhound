@@ -1,10 +1,125 @@
 package seqname
 
 import (
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestRenderMatchesTheOnDiskFormat pins the exact filename both capture
+// streams write. It is the format's one definition, so a change here is a
+// change to every capture file's name and to what a resumed case reads back.
+func TestRenderMatchesTheOnDiskFormat(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  int
+		in   string
+		want string
+	}{
+		{"llm label", 0, "metrics-hound", "000-metrics-hound.json"},
+		{"mcp tool", 0, "query_range", "000-query_range.json"},
+		{"zero padded to three", 5, "hound", "005-hound.json"},
+		{"last three-digit value", 999, "echo", "999-echo.json"},
+		// #10: %03d is a minimum width. Past 999 the field grows rather than
+		// truncating or wrapping, and Prefix reads the wider field back.
+		{"widens past three digits", 1000, "hound", "1000-hound.json"},
+		{"seven digits", 1234567, "query-range", "1234567-query-range.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Render(tt.seq, tt.in); got != tt.want {
+				t.Errorf("Render(%d, %q) = %q, want %q", tt.seq, tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRenderRoundTripsThroughPrefix is the invariant that binds the two halves
+// of this package: Prefix must read back exactly what Render wrote. Both
+// capture streams call Render and resume via Next, which calls Prefix, so a
+// renderer/parser disagreement is a resumed case numbering on top of its own
+// existing captures (spec 002 §4.3).
+func TestRenderRoundTripsThroughPrefix(t *testing.T) {
+	// The corpus spans both ends of the range Render documents, [0,
+	// math.MaxInt32]: 0 and math.MaxInt32 itself are the boundaries Prefix
+	// accepts, and the widths in between are #10's territory.
+	for _, seq := range []int{0, 1, 5, 99, 100, 998, 999, 1000, 1001, 12345, 2147483646, math.MaxInt32} {
+		for _, name := range []string{"hound", "metrics-hound", "echo", "query_range", "../../evil", ""} {
+			got, ok := Prefix(Render(seq, name))
+			if !ok {
+				t.Errorf("Prefix(Render(%d, %q) = %q) rejected the name it rendered", seq, name, Render(seq, name))
+				continue
+			}
+			if got != seq {
+				t.Errorf("Prefix(Render(%d, %q)) = %d, want %d", seq, name, got, seq)
+			}
+		}
+	}
+}
+
+// TestSanitizeStripsPathSyntax checks the rule the MCP tool name has always
+// been held to and that the LLM capture label is now held to as well: nothing
+// outside [A-Za-z0-9._-] survives, so no rendered name can carry a separator.
+func TestSanitizeStripsPathSyntax(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"leaves a real label alone", "metrics-hound", "metrics-hound"},
+		{"leaves a real tool alone", "query_range", "query_range"},
+		{"parent traversal", "../evil", ".._evil"},
+		{"deep traversal", "../../etc/passwd", ".._.._etc_passwd"},
+		{"absolute path", "/etc/passwd", "_etc_passwd"},
+		{"backslash separator", `..\..\evil`, ".._.._evil"},
+		{"null byte", "ev\x00il", "ev_il"},
+		{"newline", "ev\nil", "ev_il"},
+		{"spaces and quotes", `a b"c`, "a_b_c"},
+		// Per rune, not per byte: 'ü' is two bytes and collapses to one '_'.
+		{"non-ascii", "hoünd", "ho_nd"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitize(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitize(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			if strings.ContainsAny(got, `/\`) {
+				t.Errorf("sanitize(%q) = %q, which still contains a path separator", tt.in, got)
+			}
+		})
+	}
+}
+
+// TestRenderCannotTraverse is the property the table above only samples: for
+// any name at all, the rendered filename is a single component that stays put.
+// sanitize alone does not rule out "." or ".." — Render's numeric prefix and
+// .json suffix are what do.
+func TestRenderCannotTraverse(t *testing.T) {
+	for _, name := range []string{
+		"..", ".", "../evil", "../../../../etc/passwd", "/etc/passwd",
+		`..\..\evil`, "a/b", "", "\x00", "....//....//evil",
+	} {
+		got := Render(0, name)
+		if strings.ContainsAny(got, `/\`) {
+			t.Errorf("Render(0, %q) = %q, which contains a path separator", name, got)
+		}
+		if got == "." || got == ".." {
+			t.Errorf("Render(0, %q) = %q, which is a directory reference", name, got)
+		}
+		if filepath.Base(got) != got {
+			t.Errorf("Render(0, %q) = %q, which is not a single path component", name, got)
+		}
+		// The decisive check: joining it onto a directory must land inside.
+		const dir = "/work/case/captures/mcp"
+		if joined := filepath.Join(dir, got); filepath.Dir(joined) != dir {
+			t.Errorf("Render(0, %q) joined onto %q gives %q, which escapes", name, dir, joined)
+		}
+	}
+}
 
 // TestNextParsesSequencePrefix is the single table for both capture streams.
 // It folds together what used to be two byte-identical tables — one in
