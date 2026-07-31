@@ -106,6 +106,15 @@ type Options struct {
 	// Report renders the report phase's artifacts. Required.
 	Report ReportFunc
 	// Now reads the clock; nil means time.Now.
+	//
+	// It feeds two paths with different requirements. Timestamps that get
+	// serialized are converted to UTC here, so the clock need not be. Phase
+	// durations are measured by subtracting two reads, which is only immune to
+	// clock steps if the values carry a monotonic clock reading — so a clock
+	// that normalizes its result, with .UTC() or .Round(0) or a round trip
+	// through a wire format, silently downgrades every phase duration to
+	// wall-clock arithmetic (issue #46). Return time.Now's value unmodified
+	// unless you are a test. See elapsedClock.
 	Now func() time.Time
 	// NewID mints case IDs; nil means NewCaseID from the clock. Tests
 	// override it to get stable work dir names.
@@ -118,6 +127,16 @@ type Options struct {
 	// defaults. Only the phase-timeout test replaces it — the real timeouts
 	// are measured in seconds and minutes, which no test should wait out.
 	timeout func(phase Phase) time.Duration
+	// observePhaseClock, when set, receives the raw clock reads bracketing each
+	// phase, as runPhase measured it and before anything converts them. It
+	// observes only; it cannot change what is measured or recorded.
+	//
+	// Only the monotonic-preservation test sets it. That test needs to see the
+	// reads themselves because the property it checks — that runPhase did not
+	// strip the monotonic reading before subtracting — is invisible in WallMS
+	// unless the wall and monotonic clocks actually disagree, which no test can
+	// arrange (issue #46).
+	observePhaseClock func(phase Phase, started, finished time.Time)
 }
 
 // Result is a completed walk: the case as it ended, the finding it produced,
@@ -197,26 +216,39 @@ func New(opts Options) (*Orchestrator, error) {
 func (o *Orchestrator) now() time.Time { return o.opts.Now().UTC() }
 
 // elapsedClock reads the configured clock for duration measurement, preserving
-// whatever monotonic reading it carries. With the default time.Now that is a
-// monotonic reading, which makes the subtraction in elapsedMS immune to clock
-// steps; an injected clock that has none falls back to wall-clock arithmetic,
-// which is why elapsedMS still clamps.
+// whatever monotonic reading it carries. The value is deliberately not in UTC:
+// converting it strips the monotonic reading, which is the whole point. Callers
+// that also serialize the instant call .UTC() on it at that point instead.
 //
-// The value is deliberately not in UTC: converting it would strip the monotonic
-// reading, which is the whole point. Callers that also serialize the instant
-// call .UTC() on it at that point instead.
+// This is the half of the issue #46 fix that makes the measurement *correct*,
+// as against merely non-negative. Under the default time.Now the subtraction in
+// elapsedMS is monotonic, so a clock step cannot perturb it at all. The clamp
+// alone would leave a wrong-but-non-negative answer: a 30s backwards step
+// during a phase that really ran 40s records 10s, and that undercharge is the
+// dangerous direction — it lets a crash loop run past its cap across resumes,
+// which is exactly the guarantee spec 002 §4.3 exists to provide.
+//
+// It is held in place by review rather than by a test at its point of use; see
+// the note in runPhase.
 func (o *Orchestrator) elapsedClock() time.Time { return o.opts.Now() }
 
 // elapsedMS reports how long something bracketed by two elapsedClock readings
 // took, in milliseconds, and never reports less than zero.
 //
-// This is the write site for Spend.WallMS, and clamping here is what keeps
-// negative time off disk. Both consumers of the recorded figure subtract it
-// from a cap — remainingBudget from the hound's budget, phaseTimeout from the
-// investigate deadline — so a negative value does not merely misreport the
-// ledger, it hands the next attempt *more* than the full cap on both. Clamping
-// in either consumer would fix only that one; clamping here fixes both, and
-// keeps `bloodhound cost` from reporting negative wall clock as well.
+// This is the write site for Spend.WallMS. Both consumers of the recorded
+// figure subtract it from a cap — remainingBudget from the hound's budget,
+// phaseTimeout from the investigate deadline — so a negative value does not
+// merely misreport the ledger, it hands the next attempt *more* than the full
+// cap on both. Clamping in either consumer would fix only that one; clamping
+// here fixes both, and keeps `bloodhound cost` from reporting negative wall
+// clock as well.
+//
+// Under the default time.Now this clamp never fires, because elapsedClock keeps
+// the monotonic reading and a monotonic interval cannot be negative. It earns
+// its place guarding Options.Now, an exported extension point an embedder may
+// wire to a clock with no monotonic reading at all. It cannot repair a
+// checkpoint written before this fix, though — that is Spend.Normalize's job,
+// at the read site.
 func elapsedMS(started, finished time.Time) int64 {
 	d := finished.Sub(started)
 	if d < 0 {
@@ -461,6 +493,16 @@ func (o *Orchestrator) runPhase(ctx context.Context, r *run, phase Phase, index 
 	r.phaseRefused = false
 	out, phaseErr := fn(pctx, r)
 	finished := o.elapsedClock()
+	// Both reads above must stay elapsedClock and not now(): now() calls .UTC(),
+	// which strips the monotonic reading and silently turns the measurement
+	// below back into the wall-clock arithmetic of issue #46. Swapping them is a
+	// one-token regression that no test can catch on its own — the clamp hides
+	// it, and distinguishing the two requires the wall and monotonic clocks to
+	// disagree, which no injected clock can arrange. observePhaseClock is how
+	// the monotonic-preservation test watches this call site instead.
+	if o.opts.observePhaseClock != nil {
+		o.opts.observePhaseClock(phase, started, finished)
+	}
 
 	spend := r.phaseSpend
 	// A refused phase records no wall clock at all, so the clamp never runs for

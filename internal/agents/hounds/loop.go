@@ -109,6 +109,13 @@ type Deps struct {
 	MaxOutputTokens int
 	// Now reads the clock; nil means time.Now. Tests inject a fake clock to
 	// exercise the wall-clock budget deterministically.
+	//
+	// The loop measures its elapsed time by subtracting two reads, so the
+	// values must keep the monotonic clock reading time.Now carries: a clock
+	// that normalizes its result, with .UTC() or .Round(0), downgrades the
+	// wall-clock budget check to wall-clock arithmetic that a clock step can
+	// run backwards (issue #46, and orchestrator.Options.Now for the same
+	// hazard one layer up).
 	Now func() time.Time
 }
 
