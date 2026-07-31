@@ -8,7 +8,10 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
@@ -20,31 +23,63 @@ import (
 // fakeAPI is an httptest-backed stand-in for the Anthropic Messages API. It
 // records every request body and serves canned response bodies in order.
 type fakeAPI struct {
-	t        *testing.T
-	server   *httptest.Server
-	bodies   []map[string]any
+	// tb is the test the handler reports to. It is a testing.TB rather than a
+	// *testing.T so TestFakeAPIHandlerDoesNotGoexit can substitute a recorder
+	// and observe how the handler reports.
+	tb     testing.TB
+	server *httptest.Server
+
+	// respond and statuses are the canned response body and HTTP status for
+	// request i. Both are set by the test goroutine before it makes its first
+	// request and only read by the handler after that, so the request that
+	// carries them across goroutines is also what orders the two accesses.
 	respond  []string
 	statuses []int
-	hits     int
+
+	// hits counts requests that reached the handler and hands each one its
+	// index. Atomic because the handler runs on the server's goroutines rather
+	// than the test's. That is hygiene, not a live race: Complete is
+	// synchronous, so handler invocations never actually overlap today — but
+	// nothing in the fake enforces that, and the first concurrent test to use
+	// it would make the race real.
+	hits atomic.Int64
+
+	// mu guards bodies, which needs more than an atomic can express.
+	mu sync.Mutex
+	// bodies holds the decoded body of every request, in arrival order.
+	bodies []map[string]any
 }
 
-func newFakeAPI(t *testing.T, responses ...string) *fakeAPI {
-	f := &fakeAPI{t: t, respond: responses}
+func newFakeAPI(tb testing.TB, responses ...string) *fakeAPI {
+	tb.Helper()
+	f := &fakeAPI{tb: tb, respond: responses}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Everything in here reports with tb.Errorf, never tb.Fatalf. Fatalf
+		// calls FailNow, and FailNow's runtime.Goexit is only valid on the
+		// goroutine running the test. From this handler it would unwind the
+		// handler's goroutine instead — killing the response mid-write without
+		// stopping the test, so the client sees a truncated or EOF response
+		// and the failure surfaces far from its cause. Report, answer the
+		// request, and let the test goroutine fail on the result.
 		if !strings.HasSuffix(r.URL.Path, "/messages") {
-			t.Errorf("unexpected path %q", r.URL.Path)
+			tb.Errorf("unexpected path %q", r.URL.Path)
 		}
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatalf("reading request body: %v", err)
+			tb.Errorf("reading request body: %v", err)
+			http.Error(w, "reading request body", http.StatusInternalServerError)
+			return
 		}
 		var body map[string]any
 		if err := json.Unmarshal(raw, &body); err != nil {
-			t.Fatalf("request body is not JSON: %v", err)
+			tb.Errorf("request body is not JSON: %v", err)
+			http.Error(w, "request body is not JSON", http.StatusBadRequest)
+			return
 		}
-		i := f.hits
-		f.hits++
+		i := int(f.hits.Add(1)) - 1
+		f.mu.Lock()
 		f.bodies = append(f.bodies, body)
+		f.mu.Unlock()
 
 		status := http.StatusOK
 		if i < len(f.statuses) && f.statuses[i] != 0 {
@@ -53,11 +88,112 @@ func newFakeAPI(t *testing.T, responses ...string) *fakeAPI {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		if i < len(f.respond) {
-			io.WriteString(w, f.respond[i])
+			io.WriteString(w, f.respond[i]) //nolint:errcheck // a short write shows up as a client-side decode failure
 		}
 	}))
-	t.Cleanup(f.server.Close)
+	tb.Cleanup(f.server.Close)
 	return f
+}
+
+// count reports how many requests reached the handler.
+func (f *fakeAPI) count() int { return int(f.hits.Load()) }
+
+// body returns the decoded body of request i, failing the test if that many
+// requests never arrived. Called from the test goroutine, where Fatalf is
+// valid — unlike inside the handler.
+func (f *fakeAPI) body(i int) map[string]any {
+	f.tb.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i >= len(f.bodies) {
+		f.tb.Fatalf("wanted request %d, but the fake only saw %d", i, len(f.bodies))
+	}
+	return f.bodies[i]
+}
+
+// recordingTB stands in for *testing.T inside newFakeAPI so a test can drive
+// the handler's failure paths without failing the real test. Fatalf mimics
+// testing.T faithfully — it ends the calling goroutine via runtime.Goexit —
+// which is precisely the behaviour the handler must never trigger. Everything
+// not overridden here is delegated: the embedded testing.TB is nil, so any
+// unlisted method panics rather than silently doing nothing.
+type recordingTB struct {
+	testing.TB
+	t       *testing.T
+	mu      sync.Mutex
+	errorfs int
+	fatalfs int
+}
+
+func (tb *recordingTB) Helper() {}
+
+// Cleanup registers against the real test, so the fake's server is still
+// closed when the test that owns this recorder finishes.
+func (tb *recordingTB) Cleanup(f func()) { tb.t.Cleanup(f) }
+
+func (tb *recordingTB) Errorf(string, ...any) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.errorfs++
+}
+
+func (tb *recordingTB) Fatalf(string, ...any) {
+	tb.mu.Lock()
+	tb.fatalfs++
+	tb.mu.Unlock()
+	runtime.Goexit()
+}
+
+// counts returns how many times the handler reported, by method.
+func (tb *recordingTB) counts() (errorfs, fatalfs int) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.errorfs, tb.fatalfs
+}
+
+// TestFakeAPIHandlerDoesNotGoexit pins the fix for a bug this file used to
+// have: newFakeAPI's handler reported a malformed request with t.Fatalf, and
+// Fatalf calls FailNow, whose runtime.Goexit is only valid on the goroutine
+// running the test. From an httptest handler it unwound the handler's
+// goroutine instead — net/http's connection cleanup ran and dropped the
+// connection without a response, while the test itself carried on. The visible
+// symptom was an EOF several layers away in the SDK client, which is what made
+// the real mistake hard to pin.
+//
+// The bug lives on the handler's *failure* path, which Complete can never
+// reach: the SDK always sends well-formed JSON. So this test posts to the fake
+// directly with a body that is not JSON, and checks both ends of the bug — the
+// handler must report with Errorf rather than Fatalf, and the client must get a
+// complete HTTP response back rather than a dropped connection. Against the old
+// code both assertions fail, the second one with exactly the confusing
+// downstream EOF that motivated the fix.
+func TestFakeAPIHandlerDoesNotGoexit(t *testing.T) {
+	tb := &recordingTB{t: t}
+	fake := newFakeAPI(tb, endTurnResponse)
+
+	resp, err := http.Post(fake.server.URL+"/v1/messages", "application/json",
+		strings.NewReader("this is not JSON"))
+	if err != nil {
+		t.Fatalf("POST to the fake: %v — a handler that calls runtime.Goexit "+
+			"drops the connection instead of answering", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // nothing actionable on a test client
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Errorf("reading the response body: %v — the handler did not finish writing it", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d for a body that is not JSON", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	errorfs, fatalfs := tb.counts()
+	if fatalfs != 0 {
+		t.Errorf("handler called Fatalf %d times, want 0: FailNow off the test "+
+			"goroutine kills the handler, not the test", fatalfs)
+	}
+	if errorfs != 1 {
+		t.Errorf("handler called Errorf %d times, want 1: a malformed request "+
+			"must still fail the test", errorfs)
+	}
 }
 
 func (f *fakeAPI) provider(cfg Config) *Provider {
@@ -111,7 +247,7 @@ func TestCompleteTranslatesRequest(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 
-	body := fake.bodies[0]
+	body := fake.body(0)
 	if body["model"] != "claude-test-1" {
 		t.Errorf("model = %v, want claude-test-1 (from config)", body["model"])
 	}
@@ -221,7 +357,7 @@ func TestToolUseRoundTrip(t *testing.T) {
 	}
 
 	// The follow-up request must carry the tool_use and tool_result blocks.
-	body := fake.bodies[1]
+	body := fake.body(1)
 	msgs := body["messages"].([]any)
 	if len(msgs) != 3 {
 		t.Fatalf("turn 2 sent %d messages, want 3", len(msgs))
@@ -250,7 +386,7 @@ func TestCompleteTranslatesSpecificToolChoice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	choice := fake.bodies[0]["tool_choice"].(map[string]any)
+	choice := fake.body(0)["tool_choice"].(map[string]any)
 	if choice["type"] != "tool" || choice["name"] != "submit_finding" {
 		t.Errorf("tool_choice = %v, want tool/submit_finding", choice)
 	}
@@ -267,7 +403,7 @@ func TestCompleteRejectsToolChoiceWithoutName(t *testing.T) {
 	if err == nil {
 		t.Fatal("Complete succeeded, want error for tool choice without a name")
 	}
-	if fake.hits != 0 {
+	if fake.count() != 0 {
 		t.Errorf("request went over the wire despite invalid tool choice")
 	}
 }
@@ -284,8 +420,8 @@ func TestCompleteSurfacesAPIErrorsWithoutRetrying(t *testing.T) {
 	if err == nil {
 		t.Fatal("Complete succeeded, want API error")
 	}
-	if fake.hits != 1 {
-		t.Errorf("hits = %d, want 1 — SDK retries must be disabled (retry policy lives in middleware)", fake.hits)
+	if fake.count() != 1 {
+		t.Errorf("hits = %d, want 1 — SDK retries must be disabled (retry policy lives in middleware)", fake.count())
 	}
 }
 
@@ -310,8 +446,8 @@ func TestCallerCannotReEnableSDKRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("Complete succeeded, want API error")
 	}
-	if fake.hits != 1 {
-		t.Errorf("hits = %d, want 1 — a caller's WithMaxRetries must not re-enable SDK retries", fake.hits)
+	if fake.count() != 1 {
+		t.Errorf("hits = %d, want 1 — a caller's WithMaxRetries must not re-enable SDK retries", fake.count())
 	}
 }
 
@@ -399,8 +535,8 @@ func TestRequestModelOverridesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if fake.bodies[0]["model"] != "claude-override" {
-		t.Errorf("model = %v, want claude-override", fake.bodies[0]["model"])
+	if fake.body(0)["model"] != "claude-override" {
+		t.Errorf("model = %v, want claude-override", fake.body(0)["model"])
 	}
 }
 
