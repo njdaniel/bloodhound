@@ -1,8 +1,8 @@
 # 002 — M1: The Metrics Path
 
 **Scope:** mcp-prom, metrics-hound, orchestrator v0 (intake → one hound → report).
-**Milestone:** M1 (spec 001 §6). **Status:** shipped v0.1 — 2026-07-30 (every §6
-PR merged; `test-integration` in CI; artifacts in `docs/demo-m1/`).
+**Milestone:** M1 (spec 001 §6). **Status:** shipped v0.1 — 2026-07-30 (§6 PRs
+2–7 merged; `test-integration` in CI; artifacts in `docs/demo-m1/`).
 **Demo target:** `bloodhound hunt --alert fixture.json` produces a real, metrics-only
 diagnosis of a manually broken pod against a live Prometheus.
 
