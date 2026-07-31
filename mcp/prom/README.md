@@ -55,9 +55,9 @@ One table, defined once in `guardrails.go`, shared by all tools:
 | `MaxUpstreamSeries` | 2000 | `limit` sent to `/api/v1/series` by `series_metadata` |
 | `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
-| `MaxAnnotationLen` | 200 | alert annotation values |
+| `MaxAlertAnnotationLen` | 200 | alert annotation values |
 | `MaxQueryAnnotations` | 5 | PromQL annotations per severity in `query_range` / `query_instant` |
-| `MaxQueryAnnotationLen` | 200 | one PromQL annotation (real ones run to ~141 bytes, with the metric name at the end) |
+| `MaxQueryAnnotationLen` | 200 | one PromQL annotation (real ones run 132–141 bytes, with the metric name and position at the end) |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning |
 | `FloatFormat` | `%.6g` | every sample value |
 
@@ -113,7 +113,7 @@ presence is the signal:
   "warnings_total": 8,
   "infos": ["PromQL info: …"],
   "infos_total": 1,
-  "note": "3 further warnings dropped; sorted alphabetically. …"
+  "note": "3 further warnings dropped; kept one of each distinct kind first, then alphabetically. …"
 }
 ```
 
@@ -129,13 +129,32 @@ classify a warning describing a cap bloodhound asked for, pass everything else
 through. These tools send no `limit`, so nothing here is about a bloodhound cap.
 
 Bounded like everything else: at most `MaxQueryAnnotations` per severity, each
-capped at `MaxQueryAnnotationLen`, with the drop marked in `note`. They are
-**sorted before capping**, which is load-bearing rather than cosmetic —
-Prometheus accumulates annotations in a map and serializes them in map iteration
-order, so 20 identical calls to one server returned the same 8 warnings in 7
-distinct orders. Keeping "the first five" of that would hand the model a
-different subset every call. Alphabetical, because there is no relevance signal
-to rank by.
+capped at `MaxQueryAnnotationLen`, with the drop marked in `note`.
+
+Which ones survive the cap takes two steps, and both are load-bearing.
+
+**Ordering the input**, because Prometheus accumulates annotations in a map and
+serializes them in map iteration order — identical calls to one server return
+the same annotations differently ordered, which the integration test measures
+and logs on every run. Keeping "the first five" of an arbitrary order would hand
+the model a different subset every call.
+
+**Then taking one of each distinct kind before taking a second of any**, because
+plain alphabetical order is actively biased here rather than merely arbitrary.
+Prometheus raises the per-metric annotations once per affected metric and their
+template starts with `bucket label`, while essentially every other template
+starts later in the alphabet (`encountered a mix…`, `invalid quantile…`,
+`quantile value should be…`, `vector contains…`). So the near-identical repeats
+sort first *every time*, and an alphabetical cap drops the one annotation that
+says something new. Measured: `histogram_quantile(1.5, {job="…"})` returns nine
+warnings — eight `bucket label` repeats and one `quantile value should be
+between 0 and 1, got 1.5` — and the five alphabetically first are all
+`bucket label`. A model told only those would fix the metric type and repeat the
+1.5-should-be-0.95 mistake on its next query. Annotations are grouped by the
+message up to its first quoted operand or number (the template), so while there
+are no more kinds than slots every kind is represented; repeats take the
+leftovers. The kept set is sorted for presentation, and is a function of the
+*set* of annotations, never of upstream order.
 
 `list_alerts` and `series_metadata` get no such block: annotations come from
 PromQL evaluation, and `/api/v1/alerts` and `/api/v1/metadata` do not evaluate
@@ -297,9 +316,12 @@ mean "not fetched" rather than "not registered".
   info — and asserts the exact wording the server emits, that the two severities
   arrive in separate arrays, that `/api/v1/alerts` and `/api/v1/metadata` emit
   none, and that repeated identical calls keep the *same* capped subset (which
-  they do not without the sort, since upstream order is map iteration order).
-  The wording constants are shared with the unit tests, so those fixtures cannot
-  drift from what the wire carries.
+  they do not without the ordering, since upstream order is map iteration
+  order). A `mixed kinds` subtest fires `histogram_quantile(1.5, …)` so the
+  server really does raise eight per-metric repeats plus one distinct warning,
+  and checks the distinct one survives the cap. The wording constants are shared
+  with the unit tests, so those fixtures cannot drift from what the wire
+  carries.
 - The verbatim pass-through of a *non-truncation* warning in `series_metadata`
   is unit-test-only: Prometheus v3.5.0 emits no such warning on
   `/api/v1/series`, so provoking it needs a fanout backend (Thanos, Cortex) this

@@ -101,6 +101,12 @@ var (
 	// broadBucketLabelQuery provokes one warning per metric name in the job,
 	// which is how the count cap is made to fire for real.
 	broadBucketLabelQuery = fmt.Sprintf("histogram_quantile(0.9, {job=%q})", promtest.JobName)
+	// mixedKindQuery provokes the same per-metric repeats *plus* one warning
+	// of a different kind, by asking for a quantile of 1.5 — writing a
+	// percentile as a percentage, the mistake this whole feature is meant to
+	// surface. It is what makes the crowding-out pickAcrossKinds prevents
+	// happen against a real server rather than only against the fake.
+	mixedKindQuery = fmt.Sprintf("histogram_quantile(1.5, {job=%q})", promtest.JobName)
 )
 
 // wireAnnotations is the pair of arrays as they appear on the wire. The point
@@ -145,6 +151,71 @@ func TestUpstreamAnnotationsAgainstRealPrometheus(t *testing.T) {
 	t.Run("silent endpoints", func(t *testing.T) { annotationSilentEndpoints(t, srv) })
 	t.Run("tool", func(t *testing.T) { annotationToolReport(t, srv) })
 	t.Run("cap", func(t *testing.T) { annotationToolCap(t, srv) })
+	t.Run("mixed kinds", func(t *testing.T) { annotationToolMixedKinds(t, srv) })
+}
+
+// annotationToolMixedKinds is the end-to-end regression pin for the defect
+// plain alphabetical capping had: when per-metric repeats overflow the cap and
+// a distinct warning co-occurs, the distinct one is the one that must survive.
+//
+// Both halves are asserted against the real server — that it really does raise
+// the two kinds together (a fake could be made to say anything), and that the
+// kept five include the odd one out.
+func annotationToolMixedKinds(t *testing.T, srv *promtest.Server) {
+	// Not t.Helper(), for the same reason as annotationWireBehaviour.
+
+	// Wire first: the fixture must actually produce the situation, or the tool
+	// assertion below would pass vacuously.
+	wire := rawAnnotations(t, srv, "/api/v1/query", url.Values{"query": {mixedKindQuery}})
+	var repeats, distinct []string
+	for _, w := range wire.Warnings {
+		if strings.Contains(w, "bucket label") {
+			repeats = append(repeats, w)
+			continue
+		}
+		distinct = append(distinct, w)
+	}
+	if len(repeats) <= MaxQueryAnnotations {
+		t.Fatalf("%q raised %d per-metric repeats, want more than the %d cap or nothing can be crowded out: %q",
+			mixedKindQuery, len(repeats), MaxQueryAnnotations, wire.Warnings)
+	}
+	if len(distinct) != 1 {
+		t.Fatalf("%q raised %d warnings of a kind other than bucket-label, want exactly the quantile one: %q",
+			mixedKindQuery, len(distinct), distinct)
+	}
+	if distinct[0] != realQuantileWarning {
+		t.Errorf("real quantile warning is %q, want %q. Finding, not fixup: the unit test "+
+			"TestQueryAnnotationsKeepOneOfEachKind uses that constant as its fixture.",
+			distinct[0], realQuantileWarning)
+	}
+	// The bias is only a bias because of where the two kinds sort. Spell that
+	// out here, so a future reader can see why the round-robin exists without
+	// re-deriving it.
+	if distinct[0] <= repeats[0] {
+		t.Errorf("the distinct warning %q no longer sorts after the repeats %q; "+
+			"alphabetical capping would not have dropped it and this test no longer pins what it claims",
+			distinct[0], repeats[0])
+	}
+
+	// Then the tool: the distinct warning survives the cap.
+	session := connect(t, srv.URL)
+	var got wireAnnotatedResult
+	callTool(t, session, "query_instant", map[string]any{"query": mixedKindQuery}, &got)
+	if got.Annotations == nil {
+		t.Fatalf("no annotations block for %q", mixedKindQuery)
+	}
+	if len(got.Annotations.Warnings) != MaxQueryAnnotations {
+		t.Fatalf("kept %d warnings, want the %d cap: %q",
+			len(got.Annotations.Warnings), MaxQueryAnnotations, got.Annotations.Warnings)
+	}
+	if !slices.Contains(got.Annotations.Warnings, realQuantileWarning) {
+		t.Errorf("the capped list dropped the one distinct warning.\nkept: %q\nmissing: %q\n"+
+			"A model told only the bucket-label repeats would fix the metric type and repeat the "+
+			"1.5-should-be-0.95 mistake on its next query.",
+			got.Annotations.Warnings, realQuantileWarning)
+	}
+	t.Logf("%d upstream warnings (%d per-metric repeats + %d distinct) capped to %d, distinct one kept",
+		got.Annotations.WarningsTotal, len(repeats), len(distinct), len(got.Annotations.Warnings))
 }
 
 // annotationWireBehaviour pins the server behaviour the output shape is built

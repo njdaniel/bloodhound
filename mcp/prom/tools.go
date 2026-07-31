@@ -192,13 +192,15 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			PointsThinned:  false,
 			Note:           joinNotes(notes...),
 		},
-		// Attached before the size backstop runs so its bytes are inside the
-		// budget rather than added after it. Bounded at MaxQueryAnnotations
-		// strings of MaxQueryAnnotationLen per severity, so the block can add
-		// at most ~2 KiB to the 32 KiB cap and cannot itself push a fitting
-		// payload over. It is never thinned: dropping a "this result may be
+		// Attached before the size backstop runs, so its bytes are counted
+		// against the budget rather than added after it. Bounded at
+		// MaxQueryAnnotations strings of MaxQueryAnnotationLen per severity,
+		// so it can add at most ~2 KiB to the 32 KiB cap — which does mean a
+		// result just under the cap can be pushed over it and into thinning by
+		// the annotations alone. That is the intended trade: the block is
+		// never itself thinned, because dropping a "this result may be
 		// meaningless" warning to make room for the meaningless numbers would
-		// invert the priority.
+		// invert the priority. Points are the cheaper thing to lose.
 		Annotations: shapeAnnotations(ann),
 	}
 
@@ -401,7 +403,7 @@ type alertsResult struct {
 
 // handleListAlerts implements the list_alerts tool: filtered by state
 // (default firing), sorted by active_at descending, capped at MaxAlerts,
-// annotation values truncated to MaxAnnotationLen.
+// annotation values truncated to MaxAlertAnnotationLen.
 func (s *toolServer) handleListAlerts(ctx context.Context, _ *mcp.CallToolRequest, in listAlertsInput) (*mcp.CallToolResult, any, error) {
 	state := in.State
 	if state == "" {
@@ -428,7 +430,7 @@ func (s *toolServer) handleListAlerts(ctx context.Context, _ *mcp.CallToolReques
 		}
 		annotations := make(map[string]string, len(a.Annotations))
 		for k, v := range a.Annotations {
-			annotations[k] = truncateString(v, MaxAnnotationLen)
+			annotations[k] = truncateString(v, MaxAlertAnnotationLen)
 		}
 		value := a.Value
 		if f, err := strconv.ParseFloat(value, 64); err == nil {

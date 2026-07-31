@@ -18,6 +18,12 @@ import (
 const (
 	realBucketLabelWarning = `PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "kube_pod_container_status_ready" (1:25)`
 	realNotACounterInfo    = `PromQL info: metric might not be a counter, name does not end in _total/_sum/_count/_bucket: "kube_pod_container_status_ready" (1:6)`
+	// realQuantileWarning is raised by histogram_quantile(1.5, …). It is a
+	// different *kind* of warning from realBucketLabelWarning, and the whole
+	// point of pickAcrossKinds: a broad selector raises one bucket-label
+	// warning per metric and this one just once, so an alphabetical cap would
+	// always drop it — "bucket label" sorts before "quantile value".
+	realQuantileWarning = `PromQL warning: quantile value should be between 0 and 1, got 1.5 (1:20)`
 )
 
 // annotatedBody adds warnings and infos to an already-built success envelope,
@@ -206,10 +212,15 @@ func bulkWarnings(n int) []string {
 
 // TestQueryAnnotationsAreCappedAndDeterministic covers the bound and the
 // property that makes the bound safe. Prometheus accumulates annotations in a
-// map, so it serializes them in map iteration order — 30 identical calls to one
-// v3.5.0 server returned the same eight warnings in eight different orders.
-// Keeping "the first MaxQueryAnnotations" of an arbitrary order would hand the
-// model a different subset every call, so the cap sorts first.
+// map and serializes them in map iteration order, so identical calls to one
+// server return the same annotations differently ordered — the integration
+// test measures and logs the spread on every run. Keeping "the first
+// MaxQueryAnnotations" of an arbitrary order would hand the model a different
+// subset every call, so the input is ordered before it is capped.
+//
+// Every warning here is of one kind, so the kept set is simply the
+// alphabetically first; TestQueryAnnotationsKeepOneOfEachKind covers what
+// happens when it is not.
 func TestQueryAnnotationsAreCappedAndDeterministic(t *testing.T) {
 	const total = MaxQueryAnnotations + 7
 	want := bulkWarnings(total)[:MaxQueryAnnotations] // bulkWarnings is already sorted
@@ -243,6 +254,105 @@ func TestQueryAnnotationsAreCappedAndDeterministic(t *testing.T) {
 	}
 }
 
+// TestQueryAnnotationsKeepOneOfEachKind is the regression pin for the defect
+// plain alphabetical capping had.
+//
+// The eight bucket-label repeats and the one quantile warning below are the
+// exact nine a real v3.5.0 returns for `histogram_quantile(1.5, {job="…"})`
+// against the integration fixture: the model wrote a percentile as a
+// percentage, and Prometheus said so. But "bucket label" sorts before
+// "quantile value", and the repeats outnumber the slots, so an alphabetical
+// cap kept five bucket-label sentences and dropped the only one naming the
+// actual bug. The model would have concluded "wrong metric type", switched
+// metric, and made the same 1.5 mistake again.
+//
+// This is systematic rather than unlucky: Prometheus's per-metric annotations
+// all begin "bucket label", and essentially every other template begins later
+// in the alphabet.
+func TestQueryAnnotationsKeepOneOfEachKind(t *testing.T) {
+	repeats := []string{
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "kube_pod_container_status_ready" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "kube_pod_container_status_restarts_total" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "kube_pod_container_status_waiting_reason" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "scrape_duration_seconds" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "scrape_samples_post_metric_relabeling" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "scrape_samples_scraped" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "scrape_series_added" (1:25)`,
+		`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "up" (1:25)`,
+	}
+	upstream := append(slices.Clone(repeats), realQuantileWarning)
+	if len(repeats) <= MaxQueryAnnotations {
+		t.Fatalf("fixture has %d repeats, want more than the %d cap or the crowding-out cannot happen",
+			len(repeats), MaxQueryAnnotations)
+	}
+
+	// Shuffled, because upstream order is arbitrary and the guarantee must not
+	// depend on the odd one out happening to arrive early.
+	rng := rand.New(rand.NewSource(7))
+	var first []string
+	for attempt := range 10 {
+		shuffled := slices.Clone(upstream)
+		rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+
+		ann := instantAnnotations(t, shuffled, nil)
+		if ann == nil {
+			t.Fatal("no annotations block")
+		}
+		if len(ann.Warnings) != MaxQueryAnnotations {
+			t.Fatalf("kept %d warnings, want the %d cap", len(ann.Warnings), MaxQueryAnnotations)
+		}
+		// The assertion the defect failed.
+		if !slices.Contains(ann.Warnings, realQuantileWarning) {
+			t.Fatalf("attempt %d dropped the one distinct warning.\nkept: %q\nmissing: %q\n"+
+				"It is the only one naming the actual bug; the other %d differ only in a metric name.",
+				attempt, ann.Warnings, realQuantileWarning, len(repeats))
+		}
+		// The repeats still get the leftover slots — one example of a kind is
+		// worth much more than its second, but the second is worth more than
+		// nothing.
+		if got := MaxQueryAnnotations - 1; len(ann.Warnings)-1 != got {
+			t.Errorf("kept %d bucket-label warnings, want the %d remaining slots", len(ann.Warnings)-1, got)
+		}
+		// Still deterministic and still sorted for presentation.
+		if !slices.IsSorted(ann.Warnings) {
+			t.Errorf("attempt %d returned warnings out of order: %q", attempt, ann.Warnings)
+		}
+		if attempt == 0 {
+			first = ann.Warnings
+			continue
+		}
+		if !slices.Equal(ann.Warnings, first) {
+			t.Fatalf("attempt %d kept a different subset than attempt 0:\n got: %q\nwant: %q",
+				attempt, ann.Warnings, first)
+		}
+	}
+	if ann := instantAnnotations(t, upstream, nil); !strings.Contains(ann.Note, "one of each distinct kind") {
+		t.Errorf("note = %q, does not describe the rule that decided the kept set", ann.Note)
+	}
+}
+
+// TestAnnotationKind pins the grouping key against the real templates it has
+// to separate, and against the repeats it has to merge.
+func TestAnnotationKind(t *testing.T) {
+	bucket := annotationKind(realBucketLabelWarning)
+	other := annotationKind(`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name "up" (1:25)`)
+	if bucket != other {
+		t.Errorf("two per-metric repeats got different kinds:\n %q\n %q", bucket, other)
+	}
+	quantile := annotationKind(realQuantileWarning)
+	if quantile == bucket {
+		t.Errorf("the quantile warning shares a kind with the bucket-label ones (%q); they must separate", bucket)
+	}
+	if info := annotationKind(realNotACounterInfo); info == bucket || info == quantile {
+		t.Errorf("the not-a-counter info collides with another kind: %q", info)
+	}
+	// A message with no operand at all is its own kind rather than a panic or
+	// an empty key.
+	if got := annotationKind("PromQL warning: something new"); got != "PromQL warning: something new" {
+		t.Errorf("operand-free message got kind %q, want the whole string", got)
+	}
+}
+
 // TestQueryAnnotationsCapEachSeverityIndependently checks the caps do not
 // share a budget: a flood of warnings must not crowd out the single info,
 // which is the annotation this project cares about most.
@@ -266,9 +376,10 @@ func TestQueryAnnotationsCapEachSeverityIndependently(t *testing.T) {
 	}
 }
 
-// TestQueryAnnotationTextIsBounded checks the per-string cap. The real
-// annotations run to 141 bytes, so the cap has to sit above MaxStringLen; what
-// it must not do is let an unbounded upstream string through.
+// TestQueryAnnotationTextIsBounded checks the per-string cap. Real annotations
+// run from ~132 bytes to 141 for the longest-named fixture metric, so the cap
+// has to sit above MaxStringLen; what it must not do is let an unbounded
+// upstream string through.
 func TestQueryAnnotationTextIsBounded(t *testing.T) {
 	long := "PromQL warning: " + strings.Repeat("x", 4000)
 	ann := instantAnnotations(t, []string{long}, nil)
@@ -284,10 +395,14 @@ func TestQueryAnnotationTextIsBounded(t *testing.T) {
 	}
 	// The real wording must survive intact, or the cap is set too low to be
 	// useful — this is the assertion that fails if MaxQueryAnnotationLen is
-	// ever lowered towards MaxStringLen.
-	ann = instantAnnotations(t, []string{realBucketLabelWarning}, nil)
-	if ann.Warnings[0] != realBucketLabelWarning {
-		t.Errorf("the real 141-byte warning was truncated to %q; the cap must clear real wording", ann.Warnings[0])
+	// ever lowered towards MaxStringLen, where the cut lands inside the metric
+	// name and removes the two parts that say which query to fix.
+	for _, real := range []string{realBucketLabelWarning, realNotACounterInfo, realQuantileWarning} {
+		ann = instantAnnotations(t, []string{real}, nil)
+		if ann.Warnings[0] != real {
+			t.Errorf("a real %d-byte annotation was truncated to %q; the cap must clear real wording",
+				len(real), ann.Warnings[0])
+		}
 	}
 }
 

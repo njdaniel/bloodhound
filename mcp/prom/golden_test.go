@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -150,6 +151,41 @@ func TestGoldenQueryInstantAnnotated(t *testing.T) {
 		t.Fatalf("handleQueryInstant: %v", err)
 	}
 	checkGolden(t, "query_instant_annotated", resultText(t, res))
+}
+
+// TestGoldenQueryInstantAnnotationsCapped locks the capped shape byte-exact:
+// the kept set, the ordering, the totals and the note wording all at once.
+//
+// The fixture is the nine warnings a real v3.5.0 returns for
+// `histogram_quantile(1.5, {job="…"})` — eight per-metric repeats and one
+// quantile warning — so the golden is also the readable record of what
+// pickAcrossKinds does with them. Read it: four `bucket label` and the one
+// `quantile value`, not the five alphabetically first.
+func TestGoldenQueryInstantAnnotationsCapped(t *testing.T) {
+	warnings := []string{realQuantileWarning}
+	for _, m := range []string{
+		"kube_pod_container_status_ready",
+		"kube_pod_container_status_restarts_total",
+		"kube_pod_container_status_waiting_reason",
+		"scrape_duration_seconds",
+		"scrape_samples_post_metric_relabeling",
+		"scrape_samples_scraped",
+		"scrape_series_added",
+		"up",
+	} {
+		warnings = append(warnings, fmt.Sprintf(
+			`PromQL warning: bucket label "le" is missing or has a malformed value of "" for metric name %q (1:25)`, m))
+	}
+
+	fake := goldenFake(t)
+	fake.set("/api/v1/query", 200, annotatedBody(t, fake.body("/api/v1/query"), warnings, nil))
+	res, _, err := newTestToolServer(fake).handleQueryInstant(context.Background(), nil, queryInstantInput{
+		Query: `histogram_quantile(1.5, {job="kube-state-metrics"})`,
+	})
+	if err != nil {
+		t.Fatalf("handleQueryInstant: %v", err)
+	}
+	checkGolden(t, "query_instant_annotations_capped", resultText(t, res))
 }
 
 func TestGoldenSeriesMetadata(t *testing.T) {

@@ -251,8 +251,11 @@ func thinPoints(pts []point) ([]point, bool) {
 // prefix the server is under no obligation to keep.
 //
 // The counts are named *_total to match the truncation blocks elsewhere in
-// this package, and carry the same reading: compare them to the array lengths
-// to see whether anything was dropped.
+// this package. There is deliberately no matching *_returned: those blocks
+// need one because the thing they count (series, samples) lives at the top
+// level of the payload, whereas here the kept list is the adjacent field, so
+// a _returned would only ever restate its length. Compare each total to its
+// array to see whether anything was dropped.
 type queryAnnotationsOut struct {
 	// Warnings are the kept warnings: the result may be wrong.
 	Warnings []string `json:"warnings,omitempty"`
@@ -281,16 +284,15 @@ type queryAnnotationsOut struct {
 // position in the expression. Restating those would delete the only part worth
 // having. So: everything verbatim, everything bounded.
 //
-// Sorting is load-bearing rather than cosmetic. Prometheus accumulates
-// annotations in a map, so the order it serializes them in is its map
-// iteration order: 30 identical calls to one v3.5.0 server returned the same
-// eight warnings in eight different orders. Keeping the first
-// MaxQueryAnnotations of *that* would hand the model a different subset on
-// every call and make any assertion on the output flaky. Sorting first makes
-// the kept subset a function of the set, which is the same reason
-// series_metadata orders its metrics alphabetically. There is no relevance
-// signal to rank by — every annotation is equally a problem — so alphabetical
-// is both deterministic and honest about that.
+// Ordering the input before capping is load-bearing rather than cosmetic.
+// Prometheus accumulates annotations in a map, so the order it serializes them
+// in is its map iteration order — identical calls to one server return the
+// same annotations in different orders, which the integration test measures
+// and logs on every run (TestUpstreamAnnotationsAgainstRealPrometheus/wire).
+// Keeping the first MaxQueryAnnotations of *that* would hand the model a
+// different subset on every call and make any assertion on the output flaky.
+// Which subset is kept is decided by pickAcrossKinds; see there for why plain
+// alphabetical order is not it.
 //
 // Compaction after sorting is defensive: the wire arrays are map keys and so
 // already distinct, but if that ever stops being true the cap should spend its
@@ -307,10 +309,10 @@ func shapeAnnotations(ann promAnnotations) *queryAnnotationsOut {
 	// note uses.
 	var notes []string
 	if dropped := warningsTotal - len(warnings); dropped > 0 {
-		notes = append(notes, fmt.Sprintf("%d further warnings dropped; sorted alphabetically.", dropped))
+		notes = append(notes, fmt.Sprintf("%d further warnings dropped; kept one of each distinct kind first, then alphabetically.", dropped))
 	}
 	if dropped := infosTotal - len(infos); dropped > 0 {
-		notes = append(notes, fmt.Sprintf("%d further infos dropped; sorted alphabetically.", dropped))
+		notes = append(notes, fmt.Sprintf("%d further infos dropped; kept one of each distinct kind first, then alphabetically.", dropped))
 	}
 	if len(notes) > 0 {
 		notes = append(notes, "Prometheus raises most annotations once per affected metric, so a broad selector produces near-identical repeats; narrow it to see the rest.")
@@ -338,13 +340,99 @@ func capAnnotations(in []string) ([]string, int) {
 	all = slices.Compact(all)
 	total := len(all)
 	if len(all) > MaxQueryAnnotations {
-		all = all[:MaxQueryAnnotations]
+		all = pickAcrossKinds(all, MaxQueryAnnotations)
 	}
 	out := make([]string, 0, len(all))
 	for _, s := range all {
 		out = append(out, truncateString(s, MaxQueryAnnotationLen))
 	}
 	return out, total
+}
+
+// annotationKind returns the grouping key for an annotation: the message up to
+// its first quoted operand or numeric literal.
+//
+// Prometheus builds annotations from a fixed set of templates and fills each
+// with the operand it is complaining about — a metric name in quotes, or a
+// number. Everything before that first operand is the template, so it is what
+// distinguishes "this is the bucket-label problem" from "this is the quantile
+// problem", while the eight bucket-label warnings one broad selector raises
+// collapse to a single key:
+//
+//	bucket label "le" is missing … for metric name "up" (1:25)   → `…bucket label `
+//	quantile value should be between 0 and 1, got 1.5 (1:20)     → `…should be between `
+//
+// A heuristic, deliberately. Getting it wrong only changes which subset of a
+// capped list is kept — never a message's content, never determinism — and the
+// failure mode is mild in both directions: splitting one template into two
+// kinds costs a slot, merging two into one costs the guarantee below for that
+// pair.
+func annotationKind(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '"' || (c >= '0' && c <= '9') {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+// pickAcrossKinds selects n annotations from sorted (already sorted and
+// de-duplicated) by taking one per kind in turn before taking a second of any,
+// then returns the selection in sorted order.
+//
+// Plain alphabetical truncation is what this replaces, and it was actively
+// harmful rather than merely arbitrary. Prometheus raises the per-metric
+// annotations once per affected metric, and their template — "bucket label …"
+// — starts with a `b`, while essentially every other template starts later in
+// the alphabet ("encountered a mix …", "invalid quantile …", "quantile value
+// should be …", "vector contains …"). So sorting put the near-identical
+// repeats first *every time*, and the cap dropped the one warning that said
+// something new. Measured against v3.5.0: `histogram_quantile(1.5, {job="…"})`
+// returns nine warnings — eight bucket-label repeats and one "quantile value
+// should be between 0 and 1, got 1.5" — and the five alphabetically first are
+// all bucket-label. A model told only that would fix the metric type and
+// repeat the 1.5-should-be-0.95 mistake on its next query.
+//
+// Round-robin gives the property worth having: while there are no more kinds
+// than slots, every kind is represented. The repeats still get the leftover
+// slots, since one example of a kind is worth much more than its second.
+//
+// Determinism is preserved end to end. The input is sorted and distinct, kinds
+// are visited in first-seen (so alphabetical-by-kind) order, each kind's
+// members are consumed in sorted order, and the result is sorted again before
+// return — so the output is a function of the *set* of annotations, which is
+// what the upstream map iteration order makes necessary.
+func pickAcrossKinds(sorted []string, n int) []string {
+	kinds := make([]string, 0, len(sorted))
+	groups := make(map[string][]string, len(sorted))
+	for _, s := range sorted {
+		k := annotationKind(s)
+		if _, seen := groups[k]; !seen {
+			kinds = append(kinds, k)
+		}
+		groups[k] = append(groups[k], s)
+	}
+
+	kept := make([]string, 0, n)
+	for round := 0; len(kept) < n; round++ {
+		progressed := false
+		for _, k := range kinds {
+			g := groups[k]
+			if round >= len(g) {
+				continue
+			}
+			kept = append(kept, g[round])
+			progressed = true
+			if len(kept) == n {
+				break
+			}
+		}
+		if !progressed { // every kind exhausted; nothing left to take
+			break
+		}
+	}
+	slices.Sort(kept)
+	return kept
 }
 
 // joinNotes assembles a truncation note from its parts, skipping empties.
