@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -234,6 +235,116 @@ func thinPoints(pts []point) ([]point, bool) {
 	}
 	out = append(out, pts[n-1])
 	return out, len(out) < n
+}
+
+// queryAnnotationsOut is the model-facing block carrying the PromQL
+// annotations Prometheus attached to a query_range or query_instant result.
+// It is emitted only when the server said something (see shapeAnnotations),
+// so its presence is itself the signal.
+//
+// The two severities stay in separate arrays, mirroring the wire format,
+// because they call for different actions: a warning means the numbers in this
+// very payload may be meaningless and must not be reported without a caveat,
+// while an info means the expression is a likely mistake even though the
+// result is well-defined. Flattening into one list would leave the model to
+// re-derive that from the "PromQL warning:"/"PromQL info:" prefixes — a
+// prefix the server is under no obligation to keep.
+//
+// The counts are named *_total to match the truncation blocks elsewhere in
+// this package, and carry the same reading: compare them to the array lengths
+// to see whether anything was dropped.
+type queryAnnotationsOut struct {
+	// Warnings are the kept warnings: the result may be wrong.
+	Warnings []string `json:"warnings,omitempty"`
+	// WarningsTotal is how many distinct warnings the server sent.
+	WarningsTotal int `json:"warnings_total"`
+	// Infos are the kept infos: the expression is suspect.
+	Infos []string `json:"infos,omitempty"`
+	// InfosTotal is how many distinct infos the server sent.
+	InfosTotal int `json:"infos_total"`
+	// Note names every cap this block applied, or is empty if none did.
+	Note string `json:"note,omitempty"`
+}
+
+// shapeAnnotations bounds the annotations Prometheus attached to a query
+// response and returns the block to embed, or nil when the server said
+// nothing.
+//
+// Unlike series_metadata's warning handling, nothing here is classified into a
+// bloodhound-authored sentence. That split is deliberate and consistent:
+// series_metadata classifies "results truncated due to limit" because it
+// describes a cap *bloodhound asked for* (it sends limit=MaxUpstreamSeries),
+// so it can be restated as advice the model can act on, and passes every other
+// warning verbatim. query_range and query_instant send no limit at all, so no
+// annotation they receive is about a bloodhound cap — every one is a PromQL
+// diagnostic whose value is its exact wording, naming the metric and the
+// position in the expression. Restating those would delete the only part worth
+// having. So: everything verbatim, everything bounded.
+//
+// Sorting is load-bearing rather than cosmetic. Prometheus accumulates
+// annotations in a map, so the order it serializes them in is its map
+// iteration order: 30 identical calls to one v3.5.0 server returned the same
+// eight warnings in eight different orders. Keeping the first
+// MaxQueryAnnotations of *that* would hand the model a different subset on
+// every call and make any assertion on the output flaky. Sorting first makes
+// the kept subset a function of the set, which is the same reason
+// series_metadata orders its metrics alphabetically. There is no relevance
+// signal to rank by — every annotation is equally a problem — so alphabetical
+// is both deterministic and honest about that.
+//
+// Compaction after sorting is defensive: the wire arrays are map keys and so
+// already distinct, but if that ever stops being true the cap should spend its
+// slots on distinct diagnostics rather than repeats.
+func shapeAnnotations(ann promAnnotations) *queryAnnotationsOut {
+	if ann.empty() {
+		return nil
+	}
+	warnings, warningsTotal := capAnnotations(ann.Warnings)
+	infos, infosTotal := capAnnotations(ann.Infos)
+
+	// One sentence per applied cap, in the order of the block's own fields,
+	// then the advice they share appended once — the shape series_metadata's
+	// note uses.
+	var notes []string
+	if dropped := warningsTotal - len(warnings); dropped > 0 {
+		notes = append(notes, fmt.Sprintf("%d further warnings dropped; sorted alphabetically.", dropped))
+	}
+	if dropped := infosTotal - len(infos); dropped > 0 {
+		notes = append(notes, fmt.Sprintf("%d further infos dropped; sorted alphabetically.", dropped))
+	}
+	if len(notes) > 0 {
+		notes = append(notes, "Prometheus raises most annotations once per affected metric, so a broad selector produces near-identical repeats; narrow it to see the rest.")
+	}
+	return &queryAnnotationsOut{
+		Warnings:      warnings,
+		WarningsTotal: warningsTotal,
+		Infos:         infos,
+		InfosTotal:    infosTotal,
+		Note:          joinNotes(notes...),
+	}
+}
+
+// capAnnotations sorts, de-duplicates and caps one severity's annotations at
+// MaxQueryAnnotations, truncating each to MaxQueryAnnotationLen. It returns
+// the kept strings and how many distinct ones there were. It copies rather
+// than sorting in place so the caller's slice — decoded straight out of the
+// HTTP response — is not reordered underneath it.
+func capAnnotations(in []string) ([]string, int) {
+	if len(in) == 0 {
+		return nil, 0
+	}
+	all := slices.Clone(in)
+	slices.Sort(all)
+	all = slices.Compact(all)
+	total := len(all)
+	if len(all) > MaxQueryAnnotations {
+		all = all[:MaxQueryAnnotations]
+	}
+	out := make([]string, 0, len(all))
+	for _, s := range all {
+		out = append(out, truncateString(s, MaxQueryAnnotationLen))
+	}
+	return out, total
 }
 
 // joinNotes assembles a truncation note from its parts, skipping empties.

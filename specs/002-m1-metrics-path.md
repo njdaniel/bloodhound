@@ -61,6 +61,8 @@ One table, shared by all tools, defined in one place in code:
 | `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
 | `MaxAnnotationLen` | 200 | alert annotation values |
+| `MaxQueryAnnotations` | 5 | PromQL annotations per severity in `query_range` / `query_instant` (§2.4) |
+| `MaxQueryAnnotationLen` | 200 | one PromQL annotation; above `MaxStringLen` because the metric name and source position sit at the end of a ~141-byte string |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning (§2.3) |
 | `FloatFormat` | `%.6g` | every sample value |
 
@@ -110,7 +112,8 @@ Output:
     "series_returned": 15,
     "points_thinned": false,
     "note": "27 series dropped; ranked by (max-min) descending. Narrow the selector to see specific series."
-  }
+  },
+  "annotations": { "…": "§2.4, omitted entirely when Prometheus raised none" }
 }
 ```
 
@@ -120,7 +123,7 @@ point — often it never needs to.
 #### `query_instant`
 
 Input: `{ "query": string (required), "time": RFC3339 (optional, default now) }`.
-Output: `{ "result_type": "vector"|"scalar", "samples": [{ "labels": {...}, "value": "1.5", "timestamp": 1753700000 }], "truncation": {...} }`.
+Output: `{ "result_type": "vector"|"scalar", "samples": [{ "labels": {...}, "value": "1.5", "timestamp": 1753700000 }], "truncation": {...}, "annotations": {...} }`.
 Cap `MaxInstantSamples`, ranked by |value| descending (you almost always want
 the outliers), deterministic tie-break on sorted labelset.
 
@@ -201,6 +204,65 @@ Known bias, accepted for v1: ranking by `(max − min)` favors large-magnitude
 series (a 0→1 error-ratio flip loses to a 10k-req/s wobble). The mitigation is
 the hound's prompt: prefer rate/ratio queries and narrow selectors over broad
 matches. Revisit with a normalized score only if evals show it matters.
+
+### 2.4 Upstream PromQL annotations (`query_range`, `query_instant`)
+
+Prometheus attaches non-fatal annotations to a successful evaluation, in two
+arrays with different severities. Measured against v3.5.0:
+
+```
+warnings: PromQL warning: bucket label "le" is missing or has a malformed
+          value of "" for metric name "…" (1:25)
+infos:    PromQL info: metric might not be a counter, name does not end in
+          _total/_sum/_count/_bucket: "…" (1:6)
+```
+
+A warning means the numbers in the payload may be meaningless; an info means
+the expression is a likely mistake though the result is well-defined. Both are
+carried to the model in an `annotations` block:
+
+```json
+{
+  "warnings": ["PromQL warning: …"],
+  "warnings_total": 8,
+  "infos": ["PromQL info: …"],
+  "infos_total": 1,
+  "note": "3 further warnings dropped; sorted alphabetically. …"
+}
+```
+
+Five decisions, all deliberate:
+
+- **Beside `truncation`, not inside it.** `truncation` answers "how much of the
+  answer am I seeing"; an annotation answers "is this an answer at all", and
+  nothing was dropped when Prometheus reports a malformed bucket label. Folding
+  it in would also bury it, since a model that has learned `truncation` is about
+  caps will skip the block precisely when `series_total == series_returned` —
+  the case where "the quantile you just computed is meaningless" matters most.
+- **Omitted entirely when the server was quiet**, so presence is the signal and
+  a well-formed query's payload is unchanged from before this existed.
+- **Severities stay in separate arrays**, mirroring the wire, because they call
+  for different actions. Flattening would leave the model re-deriving severity
+  from a `"PromQL warning:"` prefix the server need not keep.
+- **Verbatim, not classified.** This is the other half of the `series_metadata`
+  rule in §2.2: classify a warning that describes a cap *bloodhound asked for*
+  (there, `limit=MaxUpstreamSeries`) and pass everything else through. These
+  tools send no limit, so every annotation is a PromQL diagnostic whose value is
+  its exact wording — the metric name and the `(line:col)` position are the only
+  parts that say which query to fix.
+- **Sorted before capping at `MaxQueryAnnotations`.** Prometheus accumulates
+  annotations in a map and serializes them in map iteration order: 20 identical
+  calls to one server returned the same 8 warnings in 7 distinct orders. Keeping
+  the first N of that would hand the model a different subset every call.
+  Alphabetical, because there is no relevance signal to rank by — the same
+  reason `series_metadata` orders metrics alphabetically. Strings are capped at
+  `MaxQueryAnnotationLen`; the count cap is marked in `note` like every other.
+
+`/api/v1/alerts` and `/api/v1/metadata` are out of scope: annotations come from
+PromQL evaluation and neither endpoint evaluates an expression. Measured against
+v3.5.0, neither response carries a `warnings` or `infos` key at all, and the
+integration suite pins that so the scope decision fails loudly if it stops
+holding.
 
 ## 3. metrics-hound
 

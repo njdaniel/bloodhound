@@ -64,6 +64,29 @@ const (
 	// same truncate-plus-ellipsis rule as MaxStringLen.
 	MaxAnnotationLen = 200
 
+	// MaxQueryAnnotations caps how many PromQL annotations query_range and
+	// query_instant pass to the model, counted separately for warnings and
+	// for infos.
+	//
+	// A cap is required because the count scales with the query, not with the
+	// server: Prometheus raises most annotations once per affected metric, so
+	// `histogram_quantile(0.9, {job="…"})` against the three-metric
+	// integration fixture already returns eight warnings, and a real selector
+	// spanning hundreds of metrics returns hundreds. They are near-identical
+	// sentences differing only in a metric name, so the first few carry
+	// essentially all of the diagnostic value.
+	MaxQueryAnnotations = 5
+
+	// MaxQueryAnnotationLen caps one PromQL annotation, in bytes, using the
+	// same truncate-plus-ellipsis rule as MaxStringLen.
+	//
+	// Deliberately above MaxStringLen: the longest annotation measured against
+	// v3.5.0 is 141 bytes ("bucket label \"le\" is missing … for metric name
+	// \"kube_pod_container_status_restarts_total\" (1:25)"), and the metric
+	// name and source position sit at the *end*, so a 120-byte cap would
+	// truncate away the only two parts that say which query to fix.
+	MaxQueryAnnotationLen = 200
+
 	// MaxResponseBytes caps the serialized tool result; exceeding it
 	// triggers point-thinning (spec 002 §2.3 step 6).
 	MaxResponseBytes = 32 * 1024

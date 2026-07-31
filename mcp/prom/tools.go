@@ -79,10 +79,21 @@ type rangeTruncation struct {
 }
 
 // rangeResult is the JSON payload of a query_range tool result.
+//
+// Annotations sit beside truncation rather than inside it, and are omitted
+// when Prometheus attached none. The truncation block answers "how much of the
+// answer am I seeing"; a PromQL annotation answers "is this an answer at all",
+// which is a different question and not a truncation — nothing was dropped
+// when Prometheus reports a malformed bucket label. Folding it into
+// truncation.note would also bury it: a model that has learned truncation is
+// about caps has every reason to skip that block when series_total equals
+// series_returned, which is exactly the case where a "the quantile you just
+// computed is meaningless" warning matters most.
 type rangeResult struct {
-	ResolvedStepSeconds int64           `json:"resolved_step_seconds"`
-	Series              []rangeSeries   `json:"series"`
-	Truncation          rangeTruncation `json:"truncation"`
+	ResolvedStepSeconds int64                `json:"resolved_step_seconds"`
+	Series              []rangeSeries        `json:"series"`
+	Truncation          rangeTruncation      `json:"truncation"`
+	Annotations         *queryAnnotationsOut `json:"annotations,omitempty"`
 }
 
 // effectiveStep clamps the requested step so a series has at most
@@ -127,7 +138,7 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 	step := effectiveStep(start, end, in.StepSeconds)
 
 	// 3. Query with timeout (enforced inside promClient).
-	upstream, err := s.prom.queryRange(ctx, in.Query, start, end, step)
+	upstream, ann, err := s.prom.queryRange(ctx, in.Query, start, end, step)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -181,6 +192,14 @@ func (s *toolServer) handleQueryRange(ctx context.Context, _ *mcp.CallToolReques
 			PointsThinned:  false,
 			Note:           joinNotes(notes...),
 		},
+		// Attached before the size backstop runs so its bytes are inside the
+		// budget rather than added after it. Bounded at MaxQueryAnnotations
+		// strings of MaxQueryAnnotationLen per severity, so the block can add
+		// at most ~2 KiB to the 32 KiB cap and cannot itself push a fitting
+		// payload over. It is never thinned: dropping a "this result may be
+		// meaningless" warning to make room for the meaningless numbers would
+		// invert the priority.
+		Annotations: shapeAnnotations(ann),
 	}
 
 	// 5. Value formatting happened above (unix-second timestamps, FloatFormat
@@ -268,10 +287,13 @@ type instantTruncation struct {
 }
 
 // instantResult is the JSON payload of a query_instant tool result.
+// Annotations are placed and omitted exactly as in rangeResult; see the
+// reasoning there.
 type instantResult struct {
-	ResultType string            `json:"result_type"`
-	Samples    []instantSample   `json:"samples"`
-	Truncation instantTruncation `json:"truncation"`
+	ResultType  string               `json:"result_type"`
+	Samples     []instantSample      `json:"samples"`
+	Truncation  instantTruncation    `json:"truncation"`
+	Annotations *queryAnnotationsOut `json:"annotations,omitempty"`
 }
 
 // handleQueryInstant implements the query_instant tool: at most
@@ -286,7 +308,7 @@ func (s *toolServer) handleQueryInstant(ctx context.Context, _ *mcp.CallToolRequ
 			return nil, nil, err
 		}
 	}
-	resultType, upstream, err := s.prom.query(ctx, in.Query, ts)
+	resultType, upstream, ann, err := s.prom.query(ctx, in.Query, ts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -339,6 +361,7 @@ func (s *toolServer) handleQueryInstant(ctx context.Context, _ *mcp.CallToolRequ
 			SamplesReturned: len(samples),
 			Note:            note,
 		},
+		Annotations: shapeAnnotations(ann),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("serializing query_instant result: %w", err)

@@ -56,6 +56,8 @@ One table, defined once in `guardrails.go`, shared by all tools:
 | `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
 | `MaxAnnotationLen` | 200 | alert annotation values |
+| `MaxQueryAnnotations` | 5 | PromQL annotations per severity in `query_range` / `query_instant` |
+| `MaxQueryAnnotationLen` | 200 | one PromQL annotation (real ones run to ~141 bytes, with the metric name at the end) |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning |
 | `FloatFormat` | `%.6g` | every sample value |
 
@@ -83,10 +85,69 @@ serialized results byte-exact):
    (labels and series count, which this step cannot thin) is returned
    oversized and says so in `truncation.note`.
 
+### Upstream PromQL annotations
+
+Prometheus attaches non-fatal annotations to a successful evaluation, in two
+arrays at two severities. Measured against v3.5.0:
+
+```
+warnings: PromQL warning: bucket label "le" is missing or has a malformed
+          value of "" for metric name "…" (1:25)
+infos:    PromQL info: metric might not be a counter, name does not end in
+          _total/_sum/_count/_bucket: "…" (1:6)
+```
+
+A warning means the numbers in the payload may be meaningless — a
+`histogram_quantile` over series with malformed `le` labels is a routine
+incident-response move that returns a number Prometheus knows nothing about. An
+info means the expression is a likely mistake though the result is well-defined;
+`rate()` over a non-counter is the one an LLM writing PromQL hits most.
+
+`query_range` and `query_instant` carry both to the model in an `annotations`
+block, which is **omitted entirely when Prometheus raised nothing**, so its
+presence is the signal:
+
+```json
+"annotations": {
+  "warnings": ["PromQL warning: …"],
+  "warnings_total": 8,
+  "infos": ["PromQL info: …"],
+  "infos_total": 1,
+  "note": "3 further warnings dropped; sorted alphabetically. …"
+}
+```
+
+It sits beside `truncation` rather than inside it: `truncation` answers "how
+much of the answer am I seeing", an annotation answers "is this an answer at
+all", and nothing was dropped when Prometheus reports a malformed bucket label.
+The severities stay in separate arrays because they call for different actions.
+
+Annotations are passed **verbatim** — the metric name and `(line:col)` position
+are the only parts that say which query to fix, so there is nothing worth
+classifying. That is the other half of the `series_metadata` rule below:
+classify a warning describing a cap bloodhound asked for, pass everything else
+through. These tools send no `limit`, so nothing here is about a bloodhound cap.
+
+Bounded like everything else: at most `MaxQueryAnnotations` per severity, each
+capped at `MaxQueryAnnotationLen`, with the drop marked in `note`. They are
+**sorted before capping**, which is load-bearing rather than cosmetic —
+Prometheus accumulates annotations in a map and serializes them in map iteration
+order, so 20 identical calls to one server returned the same 8 warnings in 7
+distinct orders. Keeping "the first five" of that would hand the model a
+different subset every call. Alphabetical, because there is no relevance signal
+to rank by.
+
+`list_alerts` and `series_metadata` get no such block: annotations come from
+PromQL evaluation, and `/api/v1/alerts` and `/api/v1/metadata` do not evaluate
+an expression. Neither response carries a `warnings` or `infos` key at all
+against v3.5.0, and the integration suite pins that, so the scope decision fails
+loudly rather than silently if it stops holding.
+
 ## Tool surface
 
 All results are one MCP text content block containing JSON, always with a
-`truncation` block.
+`truncation` block. `query_range` and `query_instant` additionally carry an
+`annotations` block when Prometheus raised any (see above).
 
 ### `query_range`
 
@@ -231,9 +292,19 @@ mean "not fetched" rather than "not registered".
   `MaxUpstreamSeries` and `MaxUpstreamMetadata` metric names, so both upstream
   limits actually fire and the wording of the real truncation warning is
   asserted rather than assumed.
-- The verbatim pass-through of a *non-truncation* warning is unit-test-only:
-  Prometheus v3.5.0 emits no such warning on `/api/v1/series`, so provoking it
-  needs a fanout backend (Thanos, Cortex) this suite does not run. A failing
-  `remote_read` does warn, but only on `/api/v1/query` — not on
-  `/api/v1/series`, which is the only endpoint `series_metadata` reads
-  warnings from.
+- One integration test provokes real PromQL annotations from the S01 fixture —
+  `histogram_quantile` over a gauge for a warning, `rate()` over a gauge for an
+  info — and asserts the exact wording the server emits, that the two severities
+  arrive in separate arrays, that `/api/v1/alerts` and `/api/v1/metadata` emit
+  none, and that repeated identical calls keep the *same* capped subset (which
+  they do not without the sort, since upstream order is map iteration order).
+  The wording constants are shared with the unit tests, so those fixtures cannot
+  drift from what the wire carries.
+- The verbatim pass-through of a *non-truncation* warning in `series_metadata`
+  is unit-test-only: Prometheus v3.5.0 emits no such warning on
+  `/api/v1/series`, so provoking it needs a fanout backend (Thanos, Cortex) this
+  suite does not run. A failing `remote_read` does warn, but only on
+  `/api/v1/query` — not on `/api/v1/series`, which is the only endpoint
+  `series_metadata` reads warnings from. Since `query_instant` and `query_range`
+  now surface annotations, that `remote_read` warning does reach the model, just
+  through those tools rather than through `series_metadata`.
