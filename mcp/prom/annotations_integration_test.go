@@ -214,6 +214,14 @@ func annotationToolMixedKinds(t *testing.T, srv *promtest.Server) {
 			"1.5-should-be-0.95 mistake on its next query.",
 			got.Annotations.Warnings, realQuantileWarning)
 	}
+	// Presentation order. The `cap` subtest cannot check this meaningfully:
+	// its query raises one kind, and a round-robin over a single group comes
+	// out sorted whether or not the selection is sorted afterwards. Here the
+	// quantile warning is interleaved between repeats by the round-robin, so
+	// the assertion only holds if the kept set really is re-sorted.
+	if !slices.IsSorted(got.Annotations.Warnings) {
+		t.Errorf("kept warnings are not in sorted order: %q", got.Annotations.Warnings)
+	}
 	t.Logf("%d upstream warnings (%d per-metric repeats + %d distinct) capped to %d, distinct one kept",
 		got.Annotations.WarningsTotal, len(repeats), len(distinct), len(got.Annotations.Warnings))
 }
