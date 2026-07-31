@@ -31,61 +31,90 @@ func newPromClient(baseURL string, timeout time.Duration) *promClient {
 	}
 }
 
-// apiEnvelope is the standard Prometheus API response wrapper. Warnings
-// carries the non-fatal notices Prometheus attaches to an otherwise
-// successful response — "results truncated due to limit" among them, which is
-// the only signal that a server-side cap took effect.
+// apiEnvelope is the standard Prometheus API response wrapper.
+//
+// Warnings and Infos are the two severities of the non-fatal annotations
+// Prometheus attaches to an otherwise successful response. They are separate
+// arrays on the wire and stay separate here: a warning says the result may be
+// wrong ("bucket label \"le\" is missing or has a malformed value"), an info
+// says the expression is suspect but the result is what was asked for
+// ("metric might not be a counter, name does not end in _total/…"). Collapsing
+// them would throw away the only severity signal the server gives.
+//
+// Warnings also carries "results truncated due to limit", which is the only
+// signal that a server-side cap took effect on /api/v1/series.
 type apiEnvelope struct {
 	Status    string          `json:"status"`
 	Data      json.RawMessage `json:"data"`
 	Warnings  []string        `json:"warnings"`
+	Infos     []string        `json:"infos"`
 	ErrorType string          `json:"errorType"`
 	Error     string          `json:"error"`
 }
 
-// get performs a GET against path (e.g. "/api/v1/query_range") with params
-// and returns the "data" payload, discarding any warnings. Callers that act
-// on warnings use getWithWarnings.
+// promAnnotations carries the non-fatal notices Prometheus attached to a
+// successful response, at the two severities it distinguishes.
+type promAnnotations struct {
+	// Warnings mean the result itself may be wrong.
+	Warnings []string
+	// Infos mean the expression is suspect though the result is well-defined.
+	Infos []string
+}
+
+// empty reports whether Prometheus said nothing at all.
+func (a promAnnotations) empty() bool { return len(a.Warnings) == 0 && len(a.Infos) == 0 }
+
+// get performs a GET against path with params and returns the "data" payload,
+// discarding any annotations.
+//
+// It is only for endpoints that cannot produce them. Annotations come out of
+// PromQL evaluation, so the endpoints that never evaluate an expression —
+// /api/v1/alerts, which returns the rule manager's active alert list, and
+// /api/v1/metadata, which returns scrape-time type and help text — have
+// nothing to attach. Measured against v3.5.0: neither response carries a
+// warnings or infos key at all, and the integration suite pins that
+// (TestUpstreamAnnotationsAgainstRealPrometheus/silent_endpoints). Every
+// endpoint that does evaluate PromQL must use getAnnotated instead.
 func (c *promClient) get(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
-	data, _, err := c.getWithWarnings(ctx, path, params)
+	data, _, err := c.getAnnotated(ctx, path, params)
 	return data, err
 }
 
-// getWithWarnings performs a GET against path with params, enforcing the
-// client timeout, and returns the "data" payload plus the response's
-// warnings. Prometheus API errors (bad PromQL, invalid parameters) are
-// returned as errors carrying the upstream message so the model can correct
-// its input.
-func (c *promClient) getWithWarnings(ctx context.Context, path string, params url.Values) (json.RawMessage, []string, error) {
+// getAnnotated performs a GET against path with params, enforcing the client
+// timeout, and returns the "data" payload plus the response's annotations.
+// Prometheus API errors (bad PromQL, invalid parameters) are returned as
+// errors carrying the upstream message so the model can correct its input.
+func (c *promClient) getAnnotated(ctx context.Context, path string, params url.Values) (json.RawMessage, promAnnotations, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
+	var none promAnnotations
 	u := c.baseURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("building request for %s: %w", path, err)
+		return nil, none, fmt.Errorf("building request for %s: %w", path, err)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("calling prometheus %s: %w", path, err)
+		return nil, none, fmt.Errorf("calling prometheus %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading prometheus %s response: %w", path, err)
+		return nil, none, fmt.Errorf("reading prometheus %s response: %w", path, err)
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, nil, fmt.Errorf("decoding prometheus %s response (HTTP %d): %w", path, resp.StatusCode, err)
+		return nil, none, fmt.Errorf("decoding prometheus %s response (HTTP %d): %w", path, resp.StatusCode, err)
 	}
 	if env.Status != "success" {
-		return nil, nil, fmt.Errorf("prometheus rejected the request (%s): %s — fix the query and retry", env.ErrorType, env.Error)
+		return nil, none, fmt.Errorf("prometheus rejected the request (%s): %s — fix the query and retry", env.ErrorType, env.Error)
 	}
-	return env.Data, env.Warnings, nil
+	return env.Data, promAnnotations{Warnings: env.Warnings, Infos: env.Infos}, nil
 }
 
 // promPoint is one Prometheus sample: a float timestamp (unix seconds) and a
@@ -122,29 +151,30 @@ type promSeries struct {
 	Values []promPoint       `json:"values"`
 }
 
-// queryRange calls /api/v1/query_range and returns the matrix result.
-func (c *promClient) queryRange(ctx context.Context, query string, start, end time.Time, step int64) ([]promSeries, error) {
+// queryRange calls /api/v1/query_range and returns the matrix result together
+// with the annotations Prometheus attached to the evaluation.
+func (c *promClient) queryRange(ctx context.Context, query string, start, end time.Time, step int64) ([]promSeries, promAnnotations, error) {
 	params := url.Values{
 		"query": {query},
 		"start": {formatTime(start)},
 		"end":   {formatTime(end)},
 		"step":  {strconv.FormatInt(step, 10)},
 	}
-	data, err := c.get(ctx, "/api/v1/query_range", params)
+	data, ann, err := c.getAnnotated(ctx, "/api/v1/query_range", params)
 	if err != nil {
-		return nil, err
+		return nil, promAnnotations{}, err
 	}
 	var d struct {
 		ResultType string       `json:"resultType"`
 		Result     []promSeries `json:"result"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return nil, fmt.Errorf("decoding query_range data: %w", err)
+		return nil, promAnnotations{}, fmt.Errorf("decoding query_range data: %w", err)
 	}
 	if d.ResultType != "matrix" {
-		return nil, fmt.Errorf("query_range returned result type %q, expected matrix", d.ResultType)
+		return nil, promAnnotations{}, fmt.Errorf("query_range returned result type %q, expected matrix", d.ResultType)
 	}
-	return d.Result, nil
+	return d.Result, ann, nil
 }
 
 // promSample is one instant-vector sample.
@@ -154,39 +184,40 @@ type promSample struct {
 }
 
 // query calls /api/v1/query and returns the result type ("vector" or
-// "scalar") with the samples; a scalar comes back as one sample with an
-// empty labelset. ts may be zero to use the server's current time.
-func (c *promClient) query(ctx context.Context, query string, ts time.Time) (string, []promSample, error) {
+// "scalar") with the samples, plus the annotations Prometheus attached to the
+// evaluation; a scalar comes back as one sample with an empty labelset. ts may
+// be zero to use the server's current time.
+func (c *promClient) query(ctx context.Context, query string, ts time.Time) (string, []promSample, promAnnotations, error) {
 	params := url.Values{"query": {query}}
 	if !ts.IsZero() {
 		params.Set("time", formatTime(ts))
 	}
-	data, err := c.get(ctx, "/api/v1/query", params)
+	data, ann, err := c.getAnnotated(ctx, "/api/v1/query", params)
 	if err != nil {
-		return "", nil, err
+		return "", nil, promAnnotations{}, err
 	}
 	var d struct {
 		ResultType string          `json:"resultType"`
 		Result     json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return "", nil, fmt.Errorf("decoding query data: %w", err)
+		return "", nil, promAnnotations{}, fmt.Errorf("decoding query data: %w", err)
 	}
 	switch d.ResultType {
 	case "vector":
 		var samples []promSample
 		if err := json.Unmarshal(d.Result, &samples); err != nil {
-			return "", nil, fmt.Errorf("decoding vector result: %w", err)
+			return "", nil, promAnnotations{}, fmt.Errorf("decoding vector result: %w", err)
 		}
-		return d.ResultType, samples, nil
+		return d.ResultType, samples, ann, nil
 	case "scalar":
 		var p promPoint
 		if err := json.Unmarshal(d.Result, &p); err != nil {
-			return "", nil, fmt.Errorf("decoding scalar result: %w", err)
+			return "", nil, promAnnotations{}, fmt.Errorf("decoding scalar result: %w", err)
 		}
-		return d.ResultType, []promSample{{Metric: map[string]string{}, Value: p}}, nil
+		return d.ResultType, []promSample{{Metric: map[string]string{}, Value: p}}, ann, nil
 	default:
-		return "", nil, fmt.Errorf("query returned result type %q; use query_range for matrix results", d.ResultType)
+		return "", nil, promAnnotations{}, fmt.Errorf("query returned result type %q; use query_range for matrix results", d.ResultType)
 	}
 }
 
@@ -245,8 +276,11 @@ func (c *promClient) metadata(ctx context.Context, limit int) (map[string][]prom
 // versions that predate the parameter ignore it, so callers must still cap
 // what they use — and must read the warnings rather than the result count to
 // learn whether the server actually truncated.
+//
+// Only the warnings are returned: /api/v1/series does not evaluate PromQL, so
+// the infos half of the envelope is always empty for it.
 func (c *promClient) series(ctx context.Context, match string, start, end time.Time, limit int) ([]map[string]string, []string, error) {
-	data, warnings, err := c.getWithWarnings(ctx, "/api/v1/series", url.Values{
+	data, ann, err := c.getAnnotated(ctx, "/api/v1/series", url.Values{
 		"match[]": {match},
 		"start":   {formatTime(start)},
 		"end":     {formatTime(end)},
@@ -259,7 +293,7 @@ func (c *promClient) series(ctx context.Context, match string, start, end time.T
 	if err := json.Unmarshal(data, &sets); err != nil {
 		return nil, nil, fmt.Errorf("decoding series data: %w", err)
 	}
-	return sets, warnings, nil
+	return sets, ann.Warnings, nil
 }
 
 // formatTime renders t as unix seconds (fractional if needed) for Prometheus

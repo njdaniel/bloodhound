@@ -60,9 +60,46 @@ const (
 	// Longer strings are truncated to 117 bytes plus "…" (3 bytes).
 	MaxStringLen = 120
 
-	// MaxAnnotationLen caps alert annotation values, in bytes, using the
+	// MaxAlertAnnotationLen caps the values of the annotations attached to a
+	// Prometheus *alert* (summary, description), in bytes, using the same
+	// truncate-plus-ellipsis rule as MaxStringLen. Unrelated to
+	// MaxQueryAnnotationLen below, which bounds an entirely different thing
+	// that Prometheus also calls an annotation.
+	MaxAlertAnnotationLen = 200
+
+	// MaxQueryAnnotations caps how many PromQL annotations query_range and
+	// query_instant pass to the model, counted separately for warnings and
+	// for infos.
+	//
+	// A cap is required because the count scales with the query, not with the
+	// server: Prometheus raises the per-metric annotations once per affected
+	// metric, so `histogram_quantile(0.9, {job="…"})` against the three-metric
+	// integration fixture already returns eight warnings, and a real selector
+	// spanning hundreds of metrics returns hundreds.
+	//
+	// Those repeats are near-identical sentences differing only in a metric
+	// name, so the first few of *them* carry essentially all of their
+	// diagnostic value. What does not follow — and what an earlier version of
+	// this comment wrongly assumed — is that the first few of the whole list
+	// do. A query can raise repeats and a distinct, far more actionable
+	// annotation at once: `histogram_quantile(1.5, {job="…"})` returns eight
+	// bucket-label repeats plus one "quantile value should be between 0 and 1,
+	// got 1.5". That last one is the only one naming the actual bug, and it is
+	// exactly the one a naive cap discards. pickAcrossKinds is what keeps a
+	// distinct kind from being crowded out; this constant only decides how
+	// many survive.
+	MaxQueryAnnotations = 5
+
+	// MaxQueryAnnotationLen caps one PromQL annotation, in bytes, using the
 	// same truncate-plus-ellipsis rule as MaxStringLen.
-	MaxAnnotationLen = 200
+	//
+	// Deliberately above MaxStringLen. Real annotations measured against
+	// v3.5.0 run from ~132 bytes ("bucket label \"le\" is missing … for metric
+	// name \"kube_pod_container_status_ready\" (1:25)") to 141 for the
+	// longest-named fixture metric, and the metric name and source position
+	// sit at the *end* — at 120 the cut lands inside the metric name, removing
+	// the only two parts that say which query to fix.
+	MaxQueryAnnotationLen = 200
 
 	// MaxResponseBytes caps the serialized tool result; exceeding it
 	// triggers point-thinning (spec 002 §2.3 step 6).
