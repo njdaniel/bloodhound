@@ -1,7 +1,8 @@
 # 002 — M1: The Metrics Path
 
 **Scope:** mcp-prom, metrics-hound, orchestrator v0 (intake → one hound → report).
-**Milestone:** M1 (spec 001 §6). **Status:** draft v0.1 — 2026-07-28.
+**Milestone:** M1 (spec 001 §6). **Status:** shipped v0.1 — 2026-07-30 (every §6
+PR merged; `test-integration` in CI; artifacts in `docs/demo-m1/`).
 **Demo target:** `bloodhound hunt --alert fixture.json` produces a real, metrics-only
 diagnosis of a manually broken pod against a live Prometheus.
 
@@ -196,6 +197,19 @@ Applied in this order; each step is deterministic:
    thin points: keep first and last, drop every second interior point; repeat
    until it fits. Set `points_thinned: true` and note the retained resolution.
    `stats` are always computed from the **full-resolution** data, before thinning.
+
+   **The interior stride starts at index 2, and that is what makes "repeat until
+   it fits" terminate.** One pass keeps indices `0, 2, 4, …` plus the last, so a
+   series of `n ≥ 3` points comes back with `⌊(n−2)/2⌋ + 2` — strictly fewer than
+   `n` for every such `n`. Repetition therefore walks down to the two-point floor,
+   at or below which a series is returned unchanged. A stride starting at index 1
+   instead keeps index 1, so a 3-point series thins to itself: a fixed point one
+   point above the floor. The backstop gives up as soon as a pass changes nothing,
+   so that fixed point stalled it — the result shipped oversized and told the
+   model it could not be thinned further while a fitting payload was still
+   reachable (issue #33). The retained-point pattern is load-bearing, not an
+   implementation detail; `mcp/prom/shape.go` derives the full chain and the
+   sampling consequences of the stride.
 
 Known bias, accepted for v1: ranking by `(max − min)` favors large-magnitude
 series (a 0→1 error-ratio flip loses to a 10k-req/s wobble). The mitigation is

@@ -157,11 +157,11 @@ func validSubmit(id string, indices ...int) llm.Response {
 // testCase is the fixed Case the loop tests investigate.
 func testCase() orchestrator.Case {
 	return orchestrator.Case{
-		ID:          "c-20260728101500-a1b2c3",
+		ID:          "c-20260728T101500-a1b2c3",
 		AlertName:   "KubePodCrashLooping",
 		Labels:      map[string]string{"namespace": "shop", "pod": "checkout-7d9f"},
 		FiringSince: time.Date(2026, 7, 28, 10, 15, 0, 0, time.UTC),
-		WorkDir:     "work/c-20260728101500-a1b2c3",
+		WorkDir:     "work/c-20260728T101500-a1b2c3",
 	}
 }
 
