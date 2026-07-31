@@ -5,7 +5,7 @@ When an alert fires, bloodhound dispatches a pack of specialized investigator ag
 
 - Repo: `github.com/njdaniel/bloodhound`
 - License: MIT
-- Status: spec v0.1 — 2026-07-28
+- Status: active v0.1 — 2026-07-28 (M0 and M1 shipped; M2–M5 pending — §6)
 
 ---
 
@@ -236,6 +236,7 @@ Cut-scope order if time-boxed: drop ablations 2-3 → drop Ollama backend → cu
 The repo's history is itself an exhibit:
 
 - **Spec-driven:** every feature starts as `specs/NNN-*.md` (problem, design, tradeoffs, test plan) — reviewed before code.
+- **Spec status markers:** every spec header carries `Status: <lifecycle> v<version> — <date UTC>`, dated when the lifecycle last changed. **draft** = nothing built; **active** = in progress, or still the source of truth for work ahead; **shipped** = merged, demoable, closed to new scope, and citing the evidence for that.
 - **CLAUDE.md** encodes house rules: architecture map, code conventions, "always run `make check` before proposing a diff," how to run scoped tests, PR etiquette.
 - **Agent-authored PRs:** implementation PRs driven by Claude Code from the spec; Nick reviews and requests changes in comments (visible history of human oversight). PR descriptions note which parts were agent-generated.
 - **CI review agent:** lightweight workflow that runs an agent review pass on PRs (advisory comment, never blocking).
