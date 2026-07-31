@@ -218,7 +218,7 @@ func (s *Session) CallTool(ctx context.Context, tool string, args json.RawMessag
 	s.mu.Unlock()
 
 	if err == nil {
-		out.CaptureRef = path.Join(captureSubdir, captureFilename(rec.Seq, tool))
+		out.CaptureRef = path.Join(captureSubdir, seqname.Render(rec.Seq, tool))
 		rec.Result = &out
 	}
 
