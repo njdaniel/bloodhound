@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/njdaniel/bloodhound/internal/seqname"
 )
 
 // alertFixture is a minimal Alertmanager webhook payload with one firing
@@ -104,7 +106,9 @@ func (h *fakeHound) run(ctx context.Context, c Case, budget Budget) (Finding, Sp
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Finding{}, Spend{}, err
 		}
-		name := fmt.Sprintf("%03d-metrics-hound.json", n-1)
+		// seqname.Render, not a hand-rolled format: this stands in for the
+		// real capture writers, so it has to name files the way they do.
+		name := seqname.Render(n-1, "metrics-hound")
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(`{"seq":0}`), 0o644); err != nil {
 			return Finding{}, Spend{}, err
 		}
@@ -462,24 +466,45 @@ func TestResumeLoadsCompletedPhasesAndContinuesCaptureNumbering(t *testing.T) {
 }
 
 // nextCaptureSeq reports the sequence number the next capture written into dir
-// would take, mirroring the scan the capture middleware and mcpclient do.
+// would take. It calls the same seqname.Next the capture middleware and
+// mcpclient call, rather than reimplementing the scan.
+//
+// It used to reimplement it, with `fmt.Sscanf(name, "%03d-", &n)`, and the
+// reimplementation was wrong in exactly the way #10 fixed in the real
+// scanners: Sscanf honours the width, so "1000-x.json" scans as n=100 *and*
+// returns "input does not match format", and the entry was skipped. A case
+// that ran past seq 999 would have made this helper return a number lower than
+// the truth and assert the wrong thing while passing.
 func nextCaptureSeq(t *testing.T, dir string) int {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
+	next, err := seqname.Next(dir)
 	if err != nil {
 		t.Fatalf("reading capture dir: %v", err)
 	}
-	next := 0
-	for _, e := range entries {
-		var n int
-		if _, err := fmt.Sscanf(e.Name(), "%03d-", &n); err != nil {
-			continue
-		}
-		if n+1 > next {
-			next = n + 1
+	return next
+}
+
+// TestCaptureStandInAgreesWithTheSharedFormat is this package's copy of the
+// seam the two real capture packages keep: the thing that writes capture names
+// here (fakeHound.run) and the thing that reads them back (nextCaptureSeq)
+// must agree with each other and with internal/seqname.
+//
+// The resume tests above only reach seq 1, so nothing here exercised the
+// four-digit case that #10 is about, and that is how a hand-rolled Sscanf scan
+// sat in this file with #10's bug in it. This is what would notice if either
+// half were hand-rolled again.
+func TestCaptureStandInAgreesWithTheSharedFormat(t *testing.T) {
+	dir := t.TempDir()
+	// The names fakeHound.run writes, at the widths #10 cares about.
+	for _, seq := range []int{0, 999, 1000} {
+		name := seqname.Render(seq, "metrics-hound")
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(`{"seq":0}`), 0o644); err != nil {
+			t.Fatalf("seeding %s: %v", name, err)
 		}
 	}
-	return next
+	if got := nextCaptureSeq(t, dir); got != 1001 {
+		t.Errorf("nextCaptureSeq = %d, want 1001; a fixed-width scan skips 1000-metrics-hound.json and reports a stale number", got)
+	}
 }
 
 func TestSpendSumsAndCountsTowardBudgetOnResume(t *testing.T) {

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/njdaniel/bloodhound/internal/llm"
@@ -100,9 +102,14 @@ func TestCaptureSequencesFiles(t *testing.T) {
 	}
 }
 
-// The two tests below check this stream end to end: the parser table they
-// depend on lives once in internal/seqname, shared with internal/mcpclient so
-// both capture streams cannot resume with different numbering (spec 002 §4.3).
+// The two tests below check this stream end to end. Both halves of the
+// filename — seqname.Render and the seqname.Prefix that Next parses it back
+// with — now live once in internal/seqname, shared with internal/mcpclient so
+// the two capture streams cannot resume with different numbering (spec 002
+// §4.3). These stay local anyway: they are the only place the renderer and the
+// parser meet through this package's real write path, on real files on disk,
+// rather than through seqname's own round-trip test. If this stream ever grows
+// a filename rule of its own, this is what notices.
 func TestCaptureContinuesSequenceAfterResume(t *testing.T) {
 	req, resp := goldenFixtures()
 	dir := t.TempDir()
@@ -165,6 +172,75 @@ func TestCaptureContinuesSequencePastThreeDigits(t *testing.T) {
 			t.Errorf("%s was overwritten: sequence numbering collided", name)
 		}
 	}
+}
+
+// TestCaptureLabelCannotEscapeTheCaptureDir holds the LLM capture label to the
+// same rule the MCP tool name has always been held to. The label was
+// interpolated raw and path-safety was only a doc-comment contract on
+// NewCapture; it is now sanitized by seqname.Render, so a caller that gets it
+// wrong writes an oddly-named file inside the capture dir rather than
+// somewhere else on disk.
+//
+// Not attacker-reachable today: Compose passes the compile-time constant
+// hounds.MetricsLabel. This pins the enforcement so it stays true if that ever
+// stops being the only caller.
+func TestCaptureLabelCannotEscapeTheCaptureDir(t *testing.T) {
+	tests := []struct {
+		name  string
+		label string
+		want  string
+	}{
+		{"parent traversal", "../../../pwned", "case/captures/llm/000-.._.._.._pwned.json"},
+		{"path separator", "sub/dir", "case/captures/llm/000-sub_dir.json"},
+		{"absolute path", "/etc/passwd", "case/captures/llm/000-_etc_passwd.json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, resp := goldenFixtures()
+			root := t.TempDir()
+			dir := filepath.Join(root, "case", "captures")
+
+			c, err := NewCapture(llmtest.New(t, resp), dir, tt.label)
+			if err != nil {
+				t.Fatalf("NewCapture: %v", err)
+			}
+			if _, err := c.Complete(context.Background(), req); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+
+			got := filesUnder(t, root)
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("files written = %v, want exactly [%s]", got, tt.want)
+			}
+		})
+	}
+}
+
+// filesUnder lists every regular file below root, relative to root and
+// slash-separated, so a test can assert that nothing was written outside the
+// directory it expected.
+func filesUnder(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestCaptureRecordsErrors(t *testing.T) {
