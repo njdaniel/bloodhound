@@ -1,5 +1,8 @@
 # 000 — Vision
 
+**Status:** active v0.1 — 2026-07-28 (the standing statement of intent; it has
+no shipped state).
+
 bloodhound automates the first 20 minutes of incident response: the context
 gathering. An alert fires; a planner agent dispatches specialized investigator
 "hounds" over Prometheus, Loki, Kubernetes state, and runbooks — each through
