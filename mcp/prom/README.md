@@ -55,7 +55,9 @@ One table, defined once in `guardrails.go`, shared by all tools:
 | `MaxUpstreamSeries` | 2000 | `limit` sent to `/api/v1/series` by `series_metadata` |
 | `MaxUpstreamMetadata` | 2000 | `limit` sent to `/api/v1/metadata` by `series_metadata` |
 | `MaxStringLen` | 120 | any label value / metadata string (truncate to 117 + `…`) |
-| `MaxAnnotationLen` | 200 | alert annotation values |
+| `MaxAlertAnnotationLen` | 200 | alert annotation values |
+| `MaxQueryAnnotations` | 5 | PromQL annotations per severity in `query_range` / `query_instant` |
+| `MaxQueryAnnotationLen` | 200 | one PromQL annotation (real ones run 132–141 bytes, with the metric name and position at the end) |
 | `MaxResponseBytes` | 32 KiB | serialized tool result; triggers point-thinning |
 | `FloatFormat` | `%.6g` | every sample value |
 
@@ -83,10 +85,88 @@ serialized results byte-exact):
    (labels and series count, which this step cannot thin) is returned
    oversized and says so in `truncation.note`.
 
+### Upstream PromQL annotations
+
+Prometheus attaches non-fatal annotations to a successful evaluation, in two
+arrays at two severities. Measured against v3.5.0:
+
+```
+warnings: PromQL warning: bucket label "le" is missing or has a malformed
+          value of "" for metric name "…" (1:25)
+infos:    PromQL info: metric might not be a counter, name does not end in
+          _total/_sum/_count/_bucket: "…" (1:6)
+```
+
+A warning means the numbers in the payload may be meaningless — a
+`histogram_quantile` over series with malformed `le` labels is a routine
+incident-response move that returns a number Prometheus knows nothing about. An
+info means the expression is a likely mistake though the result is well-defined;
+`rate()` over a non-counter is the one an LLM writing PromQL hits most.
+
+`query_range` and `query_instant` carry both to the model in an `annotations`
+block, which is **omitted entirely when Prometheus raised nothing**, so its
+presence is the signal:
+
+```json
+"annotations": {
+  "warnings": ["PromQL warning: …"],
+  "warnings_total": 8,
+  "infos": ["PromQL info: …"],
+  "infos_total": 1,
+  "note": "3 further warnings dropped; kept one of each distinct kind first, then alphabetically. …"
+}
+```
+
+It sits beside `truncation` rather than inside it: `truncation` answers "how
+much of the answer am I seeing", an annotation answers "is this an answer at
+all", and nothing was dropped when Prometheus reports a malformed bucket label.
+The severities stay in separate arrays because they call for different actions.
+
+Annotations are passed **verbatim** — the metric name and `(line:col)` position
+are the only parts that say which query to fix, so there is nothing worth
+classifying. That is the other half of the `series_metadata` rule below:
+classify a warning describing a cap bloodhound asked for, pass everything else
+through. These tools send no `limit`, so nothing here is about a bloodhound cap.
+
+Bounded like everything else: at most `MaxQueryAnnotations` per severity, each
+capped at `MaxQueryAnnotationLen`, with the drop marked in `note`.
+
+Which ones survive the cap takes two steps, and both are load-bearing.
+
+**Ordering the input**, because Prometheus accumulates annotations in a map and
+serializes them in map iteration order — identical calls to one server return
+the same annotations differently ordered, which the integration test measures
+and logs on every run. Keeping "the first five" of an arbitrary order would hand
+the model a different subset every call.
+
+**Then taking one of each distinct kind before taking a second of any**, because
+plain alphabetical order is actively biased here rather than merely arbitrary.
+Prometheus raises the per-metric annotations once per affected metric and their
+template starts with `bucket label`, while essentially every other template
+starts later in the alphabet (`encountered a mix…`, `invalid quantile…`,
+`quantile value should be…`, `vector contains…`). So the near-identical repeats
+sort first *every time*, and an alphabetical cap drops the one annotation that
+says something new. Measured: `histogram_quantile(1.5, {job="…"})` returns nine
+warnings — eight `bucket label` repeats and one `quantile value should be
+between 0 and 1, got 1.5` — and the five alphabetically first are all
+`bucket label`. A model told only those would fix the metric type and repeat the
+1.5-should-be-0.95 mistake on its next query. Annotations are grouped by the
+message up to its first quoted operand or number (the template), so while there
+are no more kinds than slots every kind is represented; repeats take the
+leftovers. The kept set is sorted for presentation, and is a function of the
+*set* of annotations, never of upstream order.
+
+`list_alerts` and `series_metadata` get no such block: annotations come from
+PromQL evaluation, and `/api/v1/alerts` and `/api/v1/metadata` do not evaluate
+an expression. Neither response carries a `warnings` or `infos` key at all
+against v3.5.0, and the integration suite pins that, so the scope decision fails
+loudly rather than silently if it stops holding.
+
 ## Tool surface
 
 All results are one MCP text content block containing JSON, always with a
-`truncation` block.
+`truncation` block. `query_range` and `query_instant` additionally carry an
+`annotations` block when Prometheus raised any (see above).
 
 ### `query_range`
 
@@ -231,9 +311,22 @@ mean "not fetched" rather than "not registered".
   `MaxUpstreamSeries` and `MaxUpstreamMetadata` metric names, so both upstream
   limits actually fire and the wording of the real truncation warning is
   asserted rather than assumed.
-- The verbatim pass-through of a *non-truncation* warning is unit-test-only:
-  Prometheus v3.5.0 emits no such warning on `/api/v1/series`, so provoking it
-  needs a fanout backend (Thanos, Cortex) this suite does not run. A failing
-  `remote_read` does warn, but only on `/api/v1/query` — not on
-  `/api/v1/series`, which is the only endpoint `series_metadata` reads
-  warnings from.
+- One integration test provokes real PromQL annotations from the S01 fixture —
+  `histogram_quantile` over a gauge for a warning, `rate()` over a gauge for an
+  info — and asserts the exact wording the server emits, that the two severities
+  arrive in separate arrays, that `/api/v1/alerts` and `/api/v1/metadata` emit
+  none, and that repeated identical calls keep the *same* capped subset (which
+  they do not without the ordering, since upstream order is map iteration
+  order). A `mixed kinds` subtest fires `histogram_quantile(1.5, …)` so the
+  server really does raise eight per-metric repeats plus one distinct warning,
+  and checks the distinct one survives the cap. The wording constants are shared
+  with the unit tests, so those fixtures cannot drift from what the wire
+  carries.
+- The verbatim pass-through of a *non-truncation* warning in `series_metadata`
+  is unit-test-only: Prometheus v3.5.0 emits no such warning on
+  `/api/v1/series`, so provoking it needs a fanout backend (Thanos, Cortex) this
+  suite does not run. A failing `remote_read` does warn, but only on
+  `/api/v1/query` — not on `/api/v1/series`, which is the only endpoint
+  `series_metadata` reads warnings from. Since `query_instant` and `query_range`
+  now surface annotations, that `remote_read` warning does reach the model, just
+  through those tools rather than through `series_metadata`.

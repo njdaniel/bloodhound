@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -63,24 +64,47 @@ const (
 // Tool descriptions are prompt engineering: written for a model, with the
 // guardrails it must plan around stated up front.
 const (
+	listAlertsDescription = "List alerts currently active in Prometheus. " +
+		"state filters to \"firing\" (default), \"pending\", or \"all\". " +
+		"Alerts are sorted by active_at descending (newest first) and capped at 50; " +
+		"annotation values are truncated to 200 characters. " +
+		"The truncation block records any dropped alerts."
+)
+
+// annotationsDescription is the paragraph query_range and query_instant share
+// about the annotations block. It is the whole point of surfacing those
+// annotations: a model that is handed a histogram_quantile result computed
+// over malformed `le` labels will otherwise write the number into an incident
+// report as a finding, because nothing in the payload says it is meaningless.
+// So the description states the consequence, not just the field's existence.
+//
+// Built rather than declared so it quotes MaxQueryAnnotations instead of
+// repeating it — the same reason seriesMetadataDescription is built.
+var annotationsDescription = fmt.Sprintf(
+	"If Prometheus attached PromQL annotations to the evaluation they appear in an annotations block, and you must read it before using any number in this result. "+
+		"warnings mean the result itself may be wrong — a histogram_quantile over series whose \"le\" bucket label is missing or malformed, say — so do not report a value that carries one without saying what the warning was, or fix the expression and re-run. "+
+		"infos mean the expression is a likely mistake even though the result is well-defined, most often rate() over a metric that is not a counter; check the metric with series_metadata before trusting it. "+
+		"At most %d of each are returned verbatim, sorted alphabetically, with warnings_total/infos_total giving the true counts. "+
+		"An absent annotations block means Prometheus raised nothing.",
+	MaxQueryAnnotations)
+
+// queryRangeDescription and queryInstantDescription are built rather than
+// declared so they can share annotationsDescription.
+var (
 	queryRangeDescription = "Query Prometheus over a time range with a PromQL expression. " +
 		"The range (end - start) is limited to 24h — wider windows are an error; narrow your window and retry. " +
 		"Resolution is clamped to at most 120 points per series (resolved_step_seconds echoes the effective step) " +
 		"and at most 15 series are returned, ranked by (max-min) volatility descending. " +
 		"Each series carries stats (min/max/avg/last) computed from full-resolution data — read those before the points. " +
 		"Every cap applied is recorded in the truncation block; if series were dropped, narrow the selector and query again. " +
-		"Prefer rate()/ratio forms and narrow selectors over broad matches."
+		"Prefer rate()/ratio forms and narrow selectors over broad matches. " +
+		annotationsDescription
 
 	queryInstantDescription = "Evaluate a PromQL expression at a single instant (time defaults to now). " +
 		"Returns at most 100 samples, ranked by |value| descending so outliers come first. " +
 		"The truncation block records dropped samples; narrow the selector to see specific series. " +
-		"Use query_range instead when you need the shape of a value over time."
-
-	listAlertsDescription = "List alerts currently active in Prometheus. " +
-		"state filters to \"firing\" (default), \"pending\", or \"all\". " +
-		"Alerts are sorted by active_at descending (newest first) and capped at 50; " +
-		"annotation values are truncated to 200 characters. " +
-		"The truncation block records any dropped alerts."
+		"Use query_range instead when you need the shape of a value over time. " +
+		annotationsDescription
 )
 
 // seriesMetadataDescription is built rather than declared: it quotes

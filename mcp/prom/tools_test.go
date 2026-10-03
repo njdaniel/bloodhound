@@ -270,9 +270,9 @@ func TestListAlertsAnnotationTruncationAndCap(t *testing.T) {
 			g.Truncation.AlertsReturned, g.Truncation.AlertsTotal, MaxAlerts, MaxAlerts+5)
 	}
 	desc := g.Alerts[0].Annotations["description"]
-	if len(desc) != MaxAnnotationLen || !strings.HasSuffix(desc, "…") {
+	if len(desc) != MaxAlertAnnotationLen || !strings.HasSuffix(desc, "…") {
 		t.Errorf("annotation length = %d (ellipsis: %v), want %d bytes ending in …",
-			len(desc), strings.HasSuffix(desc, "…"), MaxAnnotationLen)
+			len(desc), strings.HasSuffix(desc, "…"), MaxAlertAnnotationLen)
 	}
 }
 
