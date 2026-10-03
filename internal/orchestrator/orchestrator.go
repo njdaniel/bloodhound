@@ -194,5 +194,35 @@ func (s Spend) Add(o Spend) Spend {
 	}
 }
 
+// Normalize returns the spend with every quantity clamped to zero or above.
+// Spend records resources consumed, so no field of it is meaningful negative.
+//
+// It exists for checkpoints written before the issue #46 fix, when `.UTC()`
+// stripping the monotonic clock reading let a backwards clock step mid-phase
+// record a negative WallMS. Clamping at the write site cannot repair a file
+// that is already on disk, and a negative WallMS read back is not merely a
+// wrong ledger line: remainingBudget and phaseTimeout each subtract it from a
+// cap, so it hands the next attempt more than its full budget *and* a longer
+// deadline than a fresh case gets. LoadCheckpoints normalizes what it reads so
+// that both consumers, and `bloodhound cost`, see a coherent figure.
+func (s Spend) Normalize() Spend {
+	if s.InputTokens < 0 {
+		s.InputTokens = 0
+	}
+	if s.OutputTokens < 0 {
+		s.OutputTokens = 0
+	}
+	if s.USD < 0 {
+		s.USD = 0
+	}
+	if s.ToolCalls < 0 {
+		s.ToolCalls = 0
+	}
+	if s.WallMS < 0 {
+		s.WallMS = 0
+	}
+	return s
+}
+
 // Tokens returns the total input plus output tokens.
 func (s Spend) Tokens() int { return s.InputTokens + s.OutputTokens }
